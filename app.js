@@ -6,6 +6,7 @@ import { MeshSurfaceSampler } from "three/addons/math/MeshSurfaceSampler.js";
 import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
 import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
 import { UnrealBloomPass } from "three/addons/postprocessing/UnrealBloomPass.js";
+import { mergeGeometries } from "three/addons/utils/BufferGeometryUtils.js";
 
 const FONT_URL = "./_Assets/Monoton-Regular.ttf";
 const WORDMARK = "hanelab";
@@ -76,11 +77,9 @@ rimLight.position.set(0, 0, 220);
 scene.add(rimLight);
 
 let textMesh = null;
-let glowShell = null;
-let edgeFrame = null;
-let wireFrame = null;
 let textGeometry = null;
-let textMaterial = null;
+let textVisualGroup = null;
+let letterEntries = [];
 let particleSystem = null;
 let particleMaterial = null;
 let particleCount = 0;
@@ -101,6 +100,7 @@ let logoBounds = new THREE.Vector3(420, 180, 70);
 let particleField = new THREE.Vector3(520, 220, 360);
 let viewportBounds = new THREE.Vector2(520, 220);
 let textReady = false;
+let pulseTime = 0;
 
 const particleSprite = createRadialTexture(64, "rgba(255,255,255,0.95)", "rgba(255,255,255,0)");
 const raycaster = new THREE.Raycaster();
@@ -128,6 +128,7 @@ const clock = new THREE.Clock();
 const cycleBaseColor = new THREE.Color();
 const cycleInnerColor = new THREE.Color();
 const letterPalette = Array.from({ length: LETTER_COUNT }, () => new THREE.Color());
+const letterAccentPalette = Array.from({ length: LETTER_COUNT }, () => new THREE.Color());
 cycleBaseColor.copy(TEAL);
 cycleInnerColor.copy(TEAL_SOFT);
 
@@ -196,22 +197,13 @@ function createTextMaterial() {
     transparent: true,
     uniforms: {
       uTime: { value: 0 },
-      uMinX: { value: -1 },
-      uMaxX: { value: 1 },
-      uLetterCount: { value: LETTER_COUNT }
+      uHueOffset: { value: 0 }
     },
     vertexShader: `
-      uniform float uMinX;
-      uniform float uMaxX;
-      uniform float uLetterCount;
-
-      varying float vLetterBand;
       varying vec3 vWorldPosition;
       varying vec3 vWorldNormal;
 
       void main() {
-        float normalizedX = clamp((position.x - uMinX) / max(0.0001, uMaxX - uMinX), 0.0, 0.9999);
-        vLetterBand = floor(normalizedX * uLetterCount);
         vec4 worldPosition = modelMatrix * vec4(position, 1.0);
         vWorldPosition = worldPosition.xyz;
         vWorldNormal = normalize(mat3(modelMatrix) * normal);
@@ -220,11 +212,8 @@ function createTextMaterial() {
     `,
     fragmentShader: `
       uniform float uTime;
-      uniform float uMinX;
-      uniform float uMaxX;
-      uniform float uLetterCount;
+      uniform float uHueOffset;
 
-      varying float vLetterBand;
       varying vec3 vWorldPosition;
       varying vec3 vWorldNormal;
 
@@ -238,8 +227,7 @@ function createTextMaterial() {
         vec3 normal = normalize(vWorldNormal);
         vec3 viewDir = normalize(cameraPosition - vWorldPosition);
         vec3 lightDir = normalize(vec3(-0.45, 0.75, 0.55));
-        float band = floor(vLetterBand + 0.5);
-        float hue = fract(0.47 + band * 0.115 + uTime * 0.018 + sin(uTime * 0.11 + band * 0.6) * 0.015);
+        float hue = fract(0.47 + uHueOffset + uTime * 0.018 + sin(uTime * 0.11 + uHueOffset * 6.0) * 0.015);
         float innerHue = fract(hue + 0.045);
         vec3 baseColor = hsl2rgb(vec3(hue, 0.92, 0.52));
         vec3 innerColor = hsl2rgb(vec3(innerHue, 0.96, 0.76));
@@ -250,7 +238,7 @@ function createTextMaterial() {
         float scan = sin(vWorldPosition.y * 0.04 + uTime * 1.2) * 0.02;
         float shimmer = sin(vWorldPosition.x * 0.024 - uTime * 0.8) * 0.018;
 
-        vec3 base = mix(baseColor * 0.12, innerColor * 0.82, facing * 0.25);
+        vec3 base = mix(baseColor * 0.1, innerColor * 0.8, facing * 0.18);
         vec3 lit = base * (0.34 + diffuse * 0.22 + scan * 0.65 + shimmer * 0.65);
         vec3 glow = baseColor * (0.135 + fresnel * 0.51 + facing * 0.045);
         vec3 highlight = innerColor * (facing * 0.052 + fresnel * 0.026);
@@ -262,88 +250,109 @@ function createTextMaterial() {
 }
 
 function buildText(font) {
-  const geometry = new TextGeometry(WORDMARK, {
-    font,
-    size: 132,
-    depth: 44,
-    curveSegments: 18,
-    bevelEnabled: true,
-    bevelThickness: 10,
-    bevelSize: 5,
-    bevelOffset: 0,
-    bevelSegments: 8
-  });
+  const letterSpacing = 8;
+  const letterDefs = [];
+  let totalWidth = 0;
 
-  geometry.computeBoundingBox();
-  geometry.computeVertexNormals();
-  geometry.rotateX(-0.04);
-  geometry.scale(1.03, 1.0, 1.0);
-  geometry.computeBoundingBox();
+  for (let i = 0; i < WORDMARK.length; i++) {
+    const geometry = new TextGeometry(WORDMARK[i], {
+      font,
+      size: 132,
+      depth: 44,
+      curveSegments: 18,
+      bevelEnabled: true,
+      bevelThickness: 10,
+      bevelSize: 5,
+      bevelOffset: 0,
+      bevelSegments: 8
+    });
 
-  const boundingBox = geometry.boundingBox;
-  if (!boundingBox) throw new Error("Text geometry has no bounding box");
+    geometry.computeBoundingBox();
+    geometry.computeVertexNormals();
+    geometry.rotateX(-0.04);
+    geometry.scale(1.03, 1.0, 1.0);
+    geometry.computeBoundingBox();
 
-  geometry.translate(
-    -(boundingBox.min.x + boundingBox.max.x) * 0.5,
-    -(boundingBox.min.y + boundingBox.max.y) * 0.5,
-    -(boundingBox.min.z + boundingBox.max.z) * 0.5
-  );
-  geometry.computeBoundingBox();
+    const bounds = geometry.boundingBox;
+    if (!bounds) continue;
+    const width = bounds.max.x - bounds.min.x;
+    geometry.translate(
+      -bounds.min.x,
+      -(bounds.min.y + bounds.max.y) * 0.5,
+      -(bounds.min.z + bounds.max.z) * 0.5
+    );
+    geometry.computeBoundingBox();
 
-  textMaterial = createTextMaterial();
-  if (geometry.boundingBox) {
-    textMaterial.uniforms.uMinX.value = geometry.boundingBox.min.x;
-    textMaterial.uniforms.uMaxX.value = geometry.boundingBox.max.x;
+    letterDefs.push({ geometry, width });
+    totalWidth += width;
+    if (i < WORDMARK.length - 1) totalWidth += letterSpacing;
   }
-  textMesh = new THREE.Mesh(geometry, textMaterial);
-  textMesh.renderOrder = 3;
-  logoRig.add(textMesh);
 
-  glowShell = new THREE.Mesh(
-    geometry.clone(),
-    new THREE.MeshBasicMaterial({
-      color: TEAL,
-      transparent: true,
-      opacity: 0.083,
-      blending: THREE.AdditiveBlending,
-      depthWrite: false,
-      side: THREE.BackSide
-    })
-  );
-  glowShell.scale.setScalar(1.028);
-  glowShell.renderOrder = 2;
-  logoRig.add(glowShell);
+  const mergedGeometries = [];
+  textVisualGroup = new THREE.Group();
+  letterEntries = [];
 
-  edgeFrame = new THREE.LineSegments(
-    new THREE.EdgesGeometry(geometry, 8),
-    new THREE.LineBasicMaterial({
-      color: TEAL_SOFT,
-      transparent: true,
-      opacity: 0.44,
-      blending: THREE.AdditiveBlending,
-      depthWrite: false,
-      depthTest: false
-    })
-  );
-  edgeFrame.renderOrder = 5;
-  logoRig.add(edgeFrame);
+  let cursorX = -totalWidth * 0.5;
+  for (let i = 0; i < letterDefs.length; i++) {
+    const { geometry, width } = letterDefs[i];
+    const hueOffset = i * 0.115;
+    const material = createTextMaterial();
+    material.uniforms.uHueOffset.value = hueOffset;
 
-  wireFrame = new THREE.LineSegments(
-    new THREE.WireframeGeometry(geometry),
-    new THREE.LineBasicMaterial({
-      color: TEAL,
-      transparent: true,
-      opacity: 0.1,
-      blending: THREE.AdditiveBlending,
-      depthWrite: false,
-      depthTest: false
-    })
-  );
-  wireFrame.renderOrder = 4;
-  logoRig.add(wireFrame);
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.position.x = cursorX;
+    mesh.renderOrder = 3;
+    textVisualGroup.add(mesh);
 
-  geometry.computeBoundingBox();
-  box.copy(geometry.boundingBox);
+    const glow = new THREE.Mesh(
+      geometry.clone(),
+      new THREE.MeshBasicMaterial({
+        color: TEAL,
+        transparent: true,
+        opacity: 0.083,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        side: THREE.BackSide
+      })
+    );
+    glow.position.x = cursorX;
+    glow.scale.setScalar(1.028);
+    glow.renderOrder = 2;
+    textVisualGroup.add(glow);
+
+    const edges = new THREE.LineSegments(
+      new THREE.EdgesGeometry(geometry, 8),
+      new THREE.LineBasicMaterial({
+        color: TEAL_SOFT,
+        transparent: true,
+        opacity: 0.46,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        depthTest: false
+      })
+    );
+    edges.position.x = cursorX;
+    edges.renderOrder = 5;
+    textVisualGroup.add(edges);
+
+    letterEntries.push({ mesh, material, glow, edges });
+
+    const mergeClone = geometry.clone();
+    mergeClone.translate(cursorX, 0, 0);
+    mergedGeometries.push(mergeClone);
+
+    cursorX += width + letterSpacing;
+  }
+
+  logoRig.add(textVisualGroup);
+
+  const mergedGeometry = mergeGeometries(mergedGeometries, false);
+  if (!mergedGeometry) throw new Error("Failed to merge letter geometries");
+  mergedGeometry.computeBoundingBox();
+  textGeometry = mergedGeometry;
+  textMesh = new THREE.Mesh(mergedGeometry, new THREE.MeshBasicMaterial({ visible: false }));
+
+  box.copy(mergedGeometry.boundingBox);
   box.getSize(logoBounds);
   backgroundHalo.scale.set(logoBounds.x * 1.5, logoBounds.y * 1.25, 1);
   particleField.set(
@@ -351,8 +360,6 @@ function buildText(font) {
     logoBounds.y * 1.8,
     Math.max(logoBounds.z * 5.4, 380)
   );
-
-  textGeometry = geometry;
 }
 
 function disposeParticles() {
@@ -549,6 +556,7 @@ function getLetterColor(index, time, target) {
 function updateLetterPalette(time) {
   for (let i = 0; i < LETTER_COUNT; i++) {
     getLetterColor(i, time, letterPalette[i]);
+    letterAccentPalette[i].copy(letterPalette[i]).offsetHSL(0.045, 0.04, 0.22);
   }
 }
 
@@ -558,6 +566,7 @@ function animate() {
   const dt = Math.min(clock.getDelta(), 0.033);
   const frame = dt * 60;
   const t = clock.elapsedTime;
+  pulseTime += dt;
 
   if (pointer.active) {
     updatePointerProjection(false);
@@ -567,14 +576,16 @@ function animate() {
   pointer.velocity.multiplyScalar(pointer.active ? 0.84 : 0.78);
   pointer.speed = pointer.velocity.length();
 
-  if (textMaterial) {
-    textMaterial.uniforms.uTime.value = t;
+  if (letterEntries.length > 0) {
     updateLetterPalette(t);
     cycleBaseColor.copy(letterPalette[Math.floor(LETTER_COUNT * 0.5)]);
     cycleInnerColor.copy(letterPalette[(Math.floor(LETTER_COUNT * 0.5) + 1) % LETTER_COUNT]);
-    if (glowShell) glowShell.material.color.copy(cycleBaseColor);
-    if (edgeFrame) edgeFrame.material.color.copy(cycleInnerColor);
-    if (wireFrame) wireFrame.material.color.copy(cycleBaseColor);
+    for (let i = 0; i < letterEntries.length; i++) {
+      const entry = letterEntries[i];
+      entry.material.uniforms.uTime.value = t;
+      entry.glow.material.color.copy(letterPalette[i]);
+      entry.edges.material.color.copy(letterAccentPalette[i]);
+    }
     backgroundHalo.material.color.copy(cycleBaseColor);
     rimLight.color.copy(cycleBaseColor);
   }
@@ -644,6 +655,9 @@ function animate() {
             particleAssignedColors[o] = tmpV4.x;
             particleAssignedColors[o + 1] = tmpV4.y;
             particleAssignedColors[o + 2] = tmpV4.z;
+            particleColors[o] = tmpV4.x;
+            particleColors[o + 1] = tmpV4.y;
+            particleColors[o + 2] = tmpV4.z;
           }
         }
       }
@@ -701,17 +715,24 @@ function animate() {
       const assignedB = particleAssignedColors[o + 2];
       const assigned = assignedR >= 0;
       const speedGlow = assigned
-        ? clamp(0.96 + speed * 0.16, 0.96, 1.16)
+        ? clamp(1.06 + speed * 0.22, 1.06, 1.3)
         : clamp(0.68 + speed * 0.1, 0.68, 0.98);
       const whiteMix = assigned
-        ? clamp(0.03 + speed * 0.03, 0.03, 0.09)
+        ? clamp(0.0 + speed * 0.015, 0.0, 0.03)
         : clamp(0.05 + speed * 0.05, 0.05, 0.14);
       const baseR = assignedR >= 0 ? assignedR : TEAL.r;
       const baseG = assignedG >= 0 ? assignedG : TEAL.g;
       const baseB = assignedB >= 0 ? assignedB : TEAL.b;
-      particleColors[o] = baseR * speedGlow * (1 - whiteMix) + whiteMix;
-      particleColors[o + 1] = baseG * speedGlow * (1 - whiteMix) + whiteMix;
-      particleColors[o + 2] = baseB * speedGlow * (1 - whiteMix) + whiteMix;
+      if (assigned) {
+        const pulse = 1 + Math.sin(pulseTime * 8 + seed * 9) * 0.04;
+        particleColors[o] = Math.min(1, baseR * speedGlow * pulse * (1 - whiteMix) + whiteMix);
+        particleColors[o + 1] = Math.min(1, baseG * speedGlow * pulse * (1 - whiteMix) + whiteMix);
+        particleColors[o + 2] = Math.min(1, baseB * speedGlow * pulse * (1 - whiteMix) + whiteMix);
+      } else {
+        particleColors[o] = baseR * speedGlow * (1 - whiteMix) + whiteMix;
+        particleColors[o + 1] = baseG * speedGlow * (1 - whiteMix) + whiteMix;
+        particleColors[o + 2] = baseB * speedGlow * (1 - whiteMix) + whiteMix;
+      }
     }
 
     positionAttr.needsUpdate = true;
