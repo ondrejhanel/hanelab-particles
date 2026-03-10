@@ -44,7 +44,7 @@ container.appendChild(renderer.domElement);
 
 const composer = new EffectComposer(renderer);
 const renderPass = new RenderPass(scene, camera);
-const bloomPass = new UnrealBloomPass(new THREE.Vector2(1, 1), 0.42, 0.35, 0.18);
+const bloomPass = new UnrealBloomPass(new THREE.Vector2(1, 1), 0.63, 0.4, 0.18);
 composer.addPass(renderPass);
 composer.addPass(bloomPass);
 
@@ -58,7 +58,7 @@ const backgroundHalo = new THREE.Sprite(
     transparent: true,
     blending: THREE.AdditiveBlending,
     depthWrite: false,
-    opacity: 0.08
+    opacity: 0.12
   })
 );
 backgroundHalo.position.set(0, 0, -120);
@@ -201,12 +201,17 @@ function createTextMaterial() {
       uLetterCount: { value: LETTER_COUNT }
     },
     vertexShader: `
-      varying float vLocalX;
+      uniform float uMinX;
+      uniform float uMaxX;
+      uniform float uLetterCount;
+
+      varying float vLetterBand;
       varying vec3 vWorldPosition;
       varying vec3 vWorldNormal;
 
       void main() {
-        vLocalX = position.x;
+        float normalizedX = clamp((position.x - uMinX) / max(0.0001, uMaxX - uMinX), 0.0, 0.9999);
+        vLetterBand = floor(normalizedX * uLetterCount);
         vec4 worldPosition = modelMatrix * vec4(position, 1.0);
         vWorldPosition = worldPosition.xyz;
         vWorldNormal = normalize(mat3(modelMatrix) * normal);
@@ -219,7 +224,7 @@ function createTextMaterial() {
       uniform float uMaxX;
       uniform float uLetterCount;
 
-      varying float vLocalX;
+      varying float vLetterBand;
       varying vec3 vWorldPosition;
       varying vec3 vWorldNormal;
 
@@ -233,8 +238,7 @@ function createTextMaterial() {
         vec3 normal = normalize(vWorldNormal);
         vec3 viewDir = normalize(cameraPosition - vWorldPosition);
         vec3 lightDir = normalize(vec3(-0.45, 0.75, 0.55));
-        float normalizedX = clamp((vLocalX - uMinX) / max(0.0001, uMaxX - uMinX), 0.0, 0.9999);
-        float band = floor(normalizedX * uLetterCount);
+        float band = floor(vLetterBand + 0.5);
         float hue = fract(0.47 + band * 0.115 + uTime * 0.018 + sin(uTime * 0.11 + band * 0.6) * 0.015);
         float innerHue = fract(hue + 0.045);
         vec3 baseColor = hsl2rgb(vec3(hue, 0.92, 0.52));
@@ -247,9 +251,9 @@ function createTextMaterial() {
         float shimmer = sin(vWorldPosition.x * 0.024 - uTime * 0.8) * 0.018;
 
         vec3 base = mix(baseColor * 0.12, innerColor * 0.82, facing * 0.25);
-        vec3 lit = base * (0.52 + diffuse * 0.34 + scan + shimmer);
-        vec3 glow = baseColor * (0.09 + fresnel * 0.34 + facing * 0.03);
-        vec3 highlight = innerColor * (facing * 0.08 + fresnel * 0.04);
+        vec3 lit = base * (0.34 + diffuse * 0.22 + scan * 0.65 + shimmer * 0.65);
+        vec3 glow = baseColor * (0.135 + fresnel * 0.51 + facing * 0.045);
+        vec3 highlight = innerColor * (facing * 0.052 + fresnel * 0.026);
 
         gl_FragColor = vec4(lit + glow + highlight, 0.98);
       }
@@ -300,13 +304,13 @@ function buildText(font) {
     new THREE.MeshBasicMaterial({
       color: TEAL,
       transparent: true,
-      opacity: 0.055,
+      opacity: 0.083,
       blending: THREE.AdditiveBlending,
       depthWrite: false,
       side: THREE.BackSide
     })
   );
-  glowShell.scale.setScalar(1.018);
+  glowShell.scale.setScalar(1.028);
   glowShell.renderOrder = 2;
   logoRig.add(glowShell);
 
@@ -505,8 +509,8 @@ function updateViewport() {
   camera.position.z = isMobileLayout ? 720 : 620;
   camera.updateProjectionMatrix();
 
-  bloomPass.strength = isMobileLayout ? 0.32 : 0.42;
-  bloomPass.radius = isMobileLayout ? 0.28 : 0.35;
+  bloomPass.strength = isMobileLayout ? 0.48 : 0.63;
+  bloomPass.radius = isMobileLayout ? 0.32 : 0.4;
 
   if (textReady) {
     const distance = camera.position.z;
@@ -692,11 +696,16 @@ function animate() {
       particleVelocities[o + 1] = vy;
       particleVelocities[o + 2] = vz;
 
-      const speedGlow = clamp(0.55 + speed * 0.1, 0.55, 1.0);
-      const whiteMix = clamp(0.07 + speed * 0.06, 0.07, 0.18);
       const assignedR = particleAssignedColors[o];
       const assignedG = particleAssignedColors[o + 1];
       const assignedB = particleAssignedColors[o + 2];
+      const assigned = assignedR >= 0;
+      const speedGlow = assigned
+        ? clamp(0.96 + speed * 0.16, 0.96, 1.16)
+        : clamp(0.68 + speed * 0.1, 0.68, 0.98);
+      const whiteMix = assigned
+        ? clamp(0.03 + speed * 0.03, 0.03, 0.09)
+        : clamp(0.05 + speed * 0.05, 0.05, 0.14);
       const baseR = assignedR >= 0 ? assignedR : TEAL.r;
       const baseG = assignedG >= 0 ? assignedG : TEAL.g;
       const baseB = assignedB >= 0 ? assignedB : TEAL.b;
