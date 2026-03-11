@@ -18,11 +18,28 @@ const BG_COLOR = 0x020707;
 const REFERENCE_AREA = 1440 * 900;
 const BASE_PARTICLES = 3000;
 const MIN_PARTICLES = 1600;
-const MAX_PARTICLES = 5000;
+const MAX_PARTICLES = 20000;
 const COUNT_STEP = 100;
+const FLUID_COLS = 54;
+const FLUID_ROWS = 30;
+const FLUID_CELL_COUNT = FLUID_COLS * FLUID_ROWS;
+const TUNING_STORAGE_KEY = "hanelab-motion-tuning";
+const FRICTION_MIN = 0.001;
+const FRICTION_MAX = 1;
+const RADIUS_MIN = 1.31;
+const RADIUS_MAX = 3;
+const PARTICLE_COUNT_MIN = MIN_PARTICLES;
+const PARTICLE_COUNT_MAX = MAX_PARTICLES;
 
 const container = document.getElementById("app");
 if (!container) throw new Error("Missing #app container");
+const frictionInput = document.getElementById("tuning-friction");
+const frictionNumberInput = document.getElementById("tuning-friction-number");
+const radiusInput = document.getElementById("tuning-radius");
+const radiusNumberInput = document.getElementById("tuning-radius-number");
+const particleCountInput = document.getElementById("tuning-particle-count");
+const particleCountNumberInput = document.getElementById("tuning-particle-count-number");
+const motionTuning = loadMotionTuning();
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(BG_COLOR);
@@ -83,6 +100,7 @@ let letterEntries = [];
 let particleSystem = null;
 let particleMaterial = null;
 let particleCount = 0;
+let particleTargetCount = 0;
 let particlePositions = new Float32Array(0);
 let particleVelocities = new Float32Array(0);
 let particleColors = new Float32Array(0);
@@ -92,7 +110,16 @@ let particleMass = new Float32Array(0);
 let particleColorMix = new Float32Array(0);
 let particleWake = new Float32Array(0);
 let particleAssignedColors = new Float32Array(0);
+let particleAssignedIntensity = new Float32Array(0);
+let particleAssignedLetter = new Int16Array(0);
 let particleSpin = new Float32Array(0);
+let fluidVelocityX = new Float32Array(FLUID_CELL_COUNT);
+let fluidVelocityY = new Float32Array(FLUID_CELL_COUNT);
+let fluidVelocityNextX = new Float32Array(FLUID_CELL_COUNT);
+let fluidVelocityNextY = new Float32Array(FLUID_CELL_COUNT);
+let fluidPressure = new Float32Array(FLUID_CELL_COUNT);
+let fluidPressureNext = new Float32Array(FLUID_CELL_COUNT);
+let fluidDivergence = new Float32Array(FLUID_CELL_COUNT);
 let positionAttr = null;
 let colorAttr = null;
 let isMobileLayout = false;
@@ -123,6 +150,8 @@ const tmpV1 = new THREE.Vector3();
 const tmpV2 = new THREE.Vector3();
 const tmpV3 = new THREE.Vector3();
 const tmpV4 = new THREE.Vector3();
+const tmpFlowA = new THREE.Vector2();
+const tmpFlowB = new THREE.Vector2();
 const box = new THREE.Box3();
 const clock = new THREE.Clock();
 const cycleBaseColor = new THREE.Color();
@@ -143,6 +172,110 @@ function hash(value) {
 
 function randomSpread(range) {
   return (Math.random() - 0.5) * range;
+}
+
+function normalizeParticleCount(value) {
+  const snapped = Math.round(value / COUNT_STEP) * COUNT_STEP;
+  return clamp(snapped, PARTICLE_COUNT_MIN, PARTICLE_COUNT_MAX);
+}
+
+function loadMotionTuning() {
+  const defaults = { friction: 0.5, radius: RADIUS_MIN, particleCount: null };
+  try {
+    const raw = window.localStorage.getItem(TUNING_STORAGE_KEY);
+    if (!raw) return defaults;
+    const parsed = JSON.parse(raw);
+    const parsedParticleCount = parsed.particleCount == null ? null : Number(parsed.particleCount);
+    return {
+      friction: clamp(Number(parsed.friction) || defaults.friction, FRICTION_MIN, FRICTION_MAX),
+      radius: clamp(Number(parsed.radius) || defaults.radius, RADIUS_MIN, RADIUS_MAX),
+      particleCount: parsedParticleCount != null && Number.isFinite(parsedParticleCount)
+        ? normalizeParticleCount(parsedParticleCount)
+        : defaults.particleCount
+    };
+  } catch {
+    return defaults;
+  }
+}
+
+function saveMotionTuning() {
+  try {
+    window.localStorage.setItem(TUNING_STORAGE_KEY, JSON.stringify(motionTuning));
+  } catch {
+    // Ignore storage failures; runtime tuning still works for the session.
+  }
+}
+
+function syncTuningPanel() {
+  const displayParticleCount = motionTuning.particleCount ?? (particleTargetCount || particleCount || BASE_PARTICLES);
+  if (frictionInput) frictionInput.value = motionTuning.friction.toFixed(3);
+  if (frictionNumberInput) frictionNumberInput.value = (motionTuning.friction * 100).toFixed(1);
+  if (radiusInput) radiusInput.value = motionTuning.radius.toFixed(2);
+  if (radiusNumberInput) radiusNumberInput.value = (motionTuning.radius * 100).toFixed(0);
+  if (particleCountInput) particleCountInput.value = String(displayParticleCount);
+  if (particleCountNumberInput) particleCountNumberInput.value = String(displayParticleCount);
+}
+
+function setupTuningPanel() {
+  const applyFriction = (value) => {
+    if (!Number.isFinite(value)) return;
+    motionTuning.friction = clamp(value, FRICTION_MIN, FRICTION_MAX);
+    syncTuningPanel();
+    saveMotionTuning();
+  };
+
+  const applyRadius = (value) => {
+    if (!Number.isFinite(value)) return;
+    motionTuning.radius = clamp(value, RADIUS_MIN, RADIUS_MAX);
+    syncTuningPanel();
+    saveMotionTuning();
+  };
+
+  const applyParticleCount = (value) => {
+    if (!Number.isFinite(value)) return;
+    motionTuning.particleCount = normalizeParticleCount(value);
+    particleTargetCount = motionTuning.particleCount;
+    syncTuningPanel();
+    saveMotionTuning();
+  };
+
+  syncTuningPanel();
+
+  frictionInput?.addEventListener("input", () => {
+    applyFriction(Number(frictionInput.value));
+  });
+
+  radiusInput?.addEventListener("input", () => {
+    applyRadius(Number(radiusInput.value));
+  });
+
+  frictionNumberInput?.addEventListener("input", () => {
+    applyFriction(Number(frictionNumberInput.value) / 100);
+  });
+
+  frictionNumberInput?.addEventListener("change", () => {
+    applyFriction(Number(frictionNumberInput.value) / 100);
+  });
+
+  radiusNumberInput?.addEventListener("input", () => {
+    applyRadius(Number(radiusNumberInput.value) / 100);
+  });
+
+  radiusNumberInput?.addEventListener("change", () => {
+    applyRadius(Number(radiusNumberInput.value) / 100);
+  });
+
+  particleCountInput?.addEventListener("input", () => {
+    applyParticleCount(Number(particleCountInput.value));
+  });
+
+  particleCountNumberInput?.addEventListener("input", () => {
+    applyParticleCount(Number(particleCountNumberInput.value));
+  });
+
+  particleCountNumberInput?.addEventListener("change", () => {
+    applyParticleCount(Number(particleCountNumberInput.value));
+  });
 }
 
 function createRadialTexture(sizePx, innerColor, outerColor) {
@@ -366,29 +499,20 @@ function disposeParticles() {
   if (particleSystem) {
     logoRig.remove(particleSystem);
     particleSystem.geometry.dispose();
+    particleSystem = null;
   }
   if (particleMaterial) {
     particleMaterial.dispose();
+    particleMaterial = null;
   }
+  positionAttr = null;
+  colorAttr = null;
+  particleCount = 0;
+  particleTargetCount = 0;
 }
 
-function buildParticles(count) {
-  if (!textGeometry || !textMesh) return;
-
-  disposeParticles();
-
-  particleCount = count;
-  particlePositions = new Float32Array(count * 3);
-  particleVelocities = new Float32Array(count * 3);
-  particleColors = new Float32Array(count * 3);
-  particleSeeds = new Float32Array(count);
-  particleTurbulence = new Float32Array(count);
-  particleMass = new Float32Array(count);
-  particleColorMix = new Float32Array(count);
-  particleWake = new Float32Array(count);
-  particleAssignedColors = new Float32Array(count * 3);
-  particleSpin = new Float32Array(count);
-
+function ensureParticleMaterial() {
+  if (particleMaterial) return;
   particleMaterial = new THREE.PointsMaterial({
     map: particleSprite,
     color: 0xffffff,
@@ -401,8 +525,110 @@ function buildParticles(count) {
     vertexColors: true,
     size: isMobileLayout ? 12.8 : 9.8
   });
+}
 
+function rebuildParticleGeometry() {
   const geometry = new THREE.BufferGeometry();
+  positionAttr = new THREE.BufferAttribute(particlePositions, 3);
+  colorAttr = new THREE.BufferAttribute(particleColors, 3);
+  positionAttr.setUsage(THREE.DynamicDrawUsage);
+  colorAttr.setUsage(THREE.DynamicDrawUsage);
+  geometry.setAttribute("position", positionAttr);
+  geometry.setAttribute("color", colorAttr);
+
+  if (particleSystem) {
+    particleSystem.geometry.dispose();
+    particleSystem.geometry = geometry;
+    return;
+  }
+
+  particleSystem = new THREE.Points(geometry, particleMaterial);
+  particleSystem.frustumCulled = false;
+  particleSystem.renderOrder = 1;
+  logoRig.add(particleSystem);
+}
+
+function spawnParticleAt(index, sampler, shellRadius, fieldX, fieldY, fieldZ) {
+  const o = index * 3;
+  particleSeeds[index] = Math.random() * Math.PI * 2;
+  particleTurbulence[index] = 0.75 + Math.random() * 1.1;
+  particleMass[index] = 0.8 + Math.random() * 0.65;
+  particleColorMix[index] = 0;
+  particleWake[index] = 0;
+  particleAssignedIntensity[index] = 1;
+  particleAssignedLetter[index] = -1;
+  particleSpin[index] = Math.random() < 0.5 ? -1 : 1;
+  particleAssignedColors[o] = -1;
+  particleAssignedColors[o + 1] = -1;
+  particleAssignedColors[o + 2] = -1;
+
+  sampler.sample(tmpV1, tmpV2);
+  tmpV2.normalize();
+
+  if (Math.random() < 0.72) {
+    tmpV3.set(hash(index + 19) - 0.5, hash(index + 41) - 0.5, hash(index + 83) - 0.5).normalize();
+    tmpV3.crossVectors(tmpV3, tmpV2).normalize();
+    tmpV4.crossVectors(tmpV2, tmpV3).normalize();
+
+    const lift = shellRadius + Math.random() * 48;
+    const tangentJitter = randomSpread(48);
+    const bitangentJitter = randomSpread(48);
+
+    tmpV1
+      .addScaledVector(tmpV2, lift)
+      .addScaledVector(tmpV3, tangentJitter)
+      .addScaledVector(tmpV4, bitangentJitter);
+  } else {
+    tmpV1.set(
+      randomSpread(fieldX * 1.6),
+      randomSpread(fieldY * 1.7),
+      randomSpread(fieldZ * 1.2)
+    );
+  }
+
+  particlePositions[o] = tmpV1.x;
+  particlePositions[o + 1] = tmpV1.y;
+  particlePositions[o + 2] = tmpV1.z;
+
+  particleVelocities[o] = 0;
+  particleVelocities[o + 1] = 0;
+  particleVelocities[o + 2] = 0;
+
+  const whiteMix = 0.08 + Math.random() * 0.14;
+  particleColors[o] = TEAL.r * (1 - whiteMix) + whiteMix;
+  particleColors[o + 1] = TEAL.g * (1 - whiteMix) + whiteMix;
+  particleColors[o + 2] = TEAL.b * (1 - whiteMix) + whiteMix;
+}
+
+function buildParticles(count) {
+  if (!textGeometry || !textMesh) return;
+
+  disposeParticles();
+  fluidVelocityX.fill(0);
+  fluidVelocityY.fill(0);
+  fluidVelocityNextX.fill(0);
+  fluidVelocityNextY.fill(0);
+  fluidPressure.fill(0);
+  fluidPressureNext.fill(0);
+  fluidDivergence.fill(0);
+
+  particleCount = count;
+  particleTargetCount = count;
+  particlePositions = new Float32Array(count * 3);
+  particleVelocities = new Float32Array(count * 3);
+  particleColors = new Float32Array(count * 3);
+  particleSeeds = new Float32Array(count);
+  particleTurbulence = new Float32Array(count);
+  particleMass = new Float32Array(count);
+  particleColorMix = new Float32Array(count);
+  particleWake = new Float32Array(count);
+  particleAssignedColors = new Float32Array(count * 3);
+  particleAssignedIntensity = new Float32Array(count);
+  particleAssignedLetter = new Int16Array(count);
+  particleSpin = new Float32Array(count);
+
+  ensureParticleMaterial();
+
   const sampler = new MeshSurfaceSampler(textMesh).build();
   const bounds = textGeometry.boundingBox?.getSize(new THREE.Vector3()) || new THREE.Vector3(600, 140, 40);
   const shellRadius = Math.max(bounds.x * 0.11, 28);
@@ -411,66 +637,298 @@ function buildParticles(count) {
   const fieldZ = particleField.z;
 
   for (let i = 0; i < count; i++) {
-    const o = i * 3;
-    particleSeeds[i] = Math.random() * Math.PI * 2;
-    particleTurbulence[i] = 0.75 + Math.random() * 1.1;
-    particleMass[i] = 0.8 + Math.random() * 0.65;
-    particleColorMix[i] = 0;
-    particleWake[i] = 0;
-    particleSpin[i] = Math.random() < 0.5 ? -1 : 1;
-    particleAssignedColors[o] = -1;
-    particleAssignedColors[o + 1] = -1;
-    particleAssignedColors[o + 2] = -1;
-
-    sampler.sample(tmpV1, tmpV2);
-    tmpV2.normalize();
-
-    if (Math.random() < 0.72) {
-      tmpV3.set(hash(i + 19) - 0.5, hash(i + 41) - 0.5, hash(i + 83) - 0.5).normalize();
-      tmpV3.crossVectors(tmpV3, tmpV2).normalize();
-      tmpV4.crossVectors(tmpV2, tmpV3).normalize();
-
-      const lift = shellRadius + Math.random() * 48;
-      const tangentJitter = randomSpread(48);
-      const bitangentJitter = randomSpread(48);
-
-      tmpV1
-        .addScaledVector(tmpV2, lift)
-        .addScaledVector(tmpV3, tangentJitter)
-        .addScaledVector(tmpV4, bitangentJitter);
-    } else {
-      tmpV1.set(
-        randomSpread(fieldX * 1.6),
-        randomSpread(fieldY * 1.7),
-        randomSpread(fieldZ * 1.2)
-      );
-    }
-
-    particlePositions[o] = tmpV1.x;
-    particlePositions[o + 1] = tmpV1.y;
-    particlePositions[o + 2] = tmpV1.z;
-
-    particleVelocities[o] = 0;
-    particleVelocities[o + 1] = 0;
-    particleVelocities[o + 2] = 0;
-
-    const whiteMix = 0.08 + Math.random() * 0.14;
-    particleColors[o] = TEAL.r * (1 - whiteMix) + whiteMix;
-    particleColors[o + 1] = TEAL.g * (1 - whiteMix) + whiteMix;
-    particleColors[o + 2] = TEAL.b * (1 - whiteMix) + whiteMix;
+    spawnParticleAt(i, sampler, shellRadius, fieldX, fieldY, fieldZ);
   }
 
-  positionAttr = new THREE.BufferAttribute(particlePositions, 3);
-  colorAttr = new THREE.BufferAttribute(particleColors, 3);
-  positionAttr.setUsage(THREE.DynamicDrawUsage);
-  colorAttr.setUsage(THREE.DynamicDrawUsage);
-  geometry.setAttribute("position", positionAttr);
-  geometry.setAttribute("color", colorAttr);
+  rebuildParticleGeometry();
+}
 
-  particleSystem = new THREE.Points(geometry, particleMaterial);
-  particleSystem.frustumCulled = false;
-  particleSystem.renderOrder = 1;
-  logoRig.add(particleSystem);
+function resizeParticleSystem(nextCount) {
+  if (!textGeometry || !textMesh) return;
+  const targetCount = normalizeParticleCount(nextCount);
+  if (targetCount === particleCount) return;
+  if (!particleSystem || particleCount === 0) {
+    buildParticles(targetCount);
+    return;
+  }
+
+  const copyCount = Math.min(particleCount, targetCount);
+  const nextPositions = new Float32Array(targetCount * 3);
+  const nextVelocities = new Float32Array(targetCount * 3);
+  const nextColors = new Float32Array(targetCount * 3);
+  const nextSeeds = new Float32Array(targetCount);
+  const nextTurbulence = new Float32Array(targetCount);
+  const nextMass = new Float32Array(targetCount);
+  const nextColorMix = new Float32Array(targetCount);
+  const nextWake = new Float32Array(targetCount);
+  const nextAssignedColors = new Float32Array(targetCount * 3);
+  const nextAssignedIntensity = new Float32Array(targetCount);
+  const nextAssignedLetter = new Int16Array(targetCount);
+  const nextSpin = new Float32Array(targetCount);
+
+  nextPositions.set(particlePositions.subarray(0, copyCount * 3));
+  nextVelocities.set(particleVelocities.subarray(0, copyCount * 3));
+  nextColors.set(particleColors.subarray(0, copyCount * 3));
+  nextSeeds.set(particleSeeds.subarray(0, copyCount));
+  nextTurbulence.set(particleTurbulence.subarray(0, copyCount));
+  nextMass.set(particleMass.subarray(0, copyCount));
+  nextColorMix.set(particleColorMix.subarray(0, copyCount));
+  nextWake.set(particleWake.subarray(0, copyCount));
+  nextAssignedColors.set(particleAssignedColors.subarray(0, copyCount * 3));
+  nextAssignedIntensity.set(particleAssignedIntensity.subarray(0, copyCount));
+  nextAssignedLetter.set(particleAssignedLetter.subarray(0, copyCount));
+  nextSpin.set(particleSpin.subarray(0, copyCount));
+
+  particlePositions = nextPositions;
+  particleVelocities = nextVelocities;
+  particleColors = nextColors;
+  particleSeeds = nextSeeds;
+  particleTurbulence = nextTurbulence;
+  particleMass = nextMass;
+  particleColorMix = nextColorMix;
+  particleWake = nextWake;
+  particleAssignedColors = nextAssignedColors;
+  particleAssignedIntensity = nextAssignedIntensity;
+  particleAssignedLetter = nextAssignedLetter;
+  particleSpin = nextSpin;
+
+  if (targetCount > copyCount) {
+    const sampler = new MeshSurfaceSampler(textMesh).build();
+    const bounds = textGeometry.boundingBox?.getSize(new THREE.Vector3()) || new THREE.Vector3(600, 140, 40);
+    const shellRadius = Math.max(bounds.x * 0.11, 28);
+    const fieldX = particleField.x;
+    const fieldY = particleField.y;
+    const fieldZ = particleField.z;
+
+    for (let i = copyCount; i < targetCount; i++) {
+      spawnParticleAt(i, sampler, shellRadius, fieldX, fieldY, fieldZ);
+    }
+  }
+
+  particleCount = targetCount;
+  rebuildParticleGeometry();
+}
+
+function sampleFluidArrays(gridX, gridY, fieldX, fieldY, target) {
+  const x = clamp(gridX, 0, FLUID_COLS - 1);
+  const y = clamp(gridY, 0, FLUID_ROWS - 1);
+  const x0 = Math.floor(x);
+  const y0 = Math.floor(y);
+  const x1 = Math.min(x0 + 1, FLUID_COLS - 1);
+  const y1 = Math.min(y0 + 1, FLUID_ROWS - 1);
+  const tx = x - x0;
+  const ty = y - y0;
+
+  const i00 = y0 * FLUID_COLS + x0;
+  const i10 = y0 * FLUID_COLS + x1;
+  const i01 = y1 * FLUID_COLS + x0;
+  const i11 = y1 * FLUID_COLS + x1;
+
+  const vx0 = fieldX[i00] + (fieldX[i10] - fieldX[i00]) * tx;
+  const vx1 = fieldX[i01] + (fieldX[i11] - fieldX[i01]) * tx;
+  const vy0 = fieldY[i00] + (fieldY[i10] - fieldY[i00]) * tx;
+  const vy1 = fieldY[i01] + (fieldY[i11] - fieldY[i01]) * tx;
+
+  target.set(
+    vx0 + (vx1 - vx0) * ty,
+    vy0 + (vy1 - vy0) * ty
+  );
+  return target;
+}
+
+function toFluidGridPosition(worldX, worldY, target) {
+  const boundX = Math.max(viewportBounds.x, 1);
+  const boundY = Math.max(viewportBounds.y, 1);
+  target.set(
+    ((clamp(worldX, -boundX, boundX) + boundX) / (boundX * 2)) * (FLUID_COLS - 1),
+    ((clamp(worldY, -boundY, boundY) + boundY) / (boundY * 2)) * (FLUID_ROWS - 1)
+  );
+  return target;
+}
+
+function sampleFluidVelocity(worldX, worldY, target) {
+  toFluidGridPosition(worldX, worldY, tmpFlowB);
+  return sampleFluidArrays(tmpFlowB.x, tmpFlowB.y, fluidVelocityX, fluidVelocityY, target);
+}
+
+function injectFluidImpulse(worldX, worldY, velocityX, velocityY, radius, strength) {
+  const speed = Math.hypot(velocityX, velocityY);
+  if (speed < 0.001) return;
+
+  const boundX = Math.max(viewportBounds.x, 1);
+  const boundY = Math.max(viewportBounds.y, 1);
+  const spanX = boundX * 2;
+  const spanY = boundY * 2;
+  const cellSizeX = spanX / Math.max(FLUID_COLS - 1, 1);
+  const cellSizeY = spanY / Math.max(FLUID_ROWS - 1, 1);
+  const radiusSq = radius * radius;
+  const impulseX = velocityX * strength;
+  const impulseY = velocityY * strength;
+  const dirX = velocityX / speed;
+  const dirY = velocityY / speed;
+
+  toFluidGridPosition(worldX, worldY, tmpFlowA);
+  const minX = Math.max(0, Math.floor(tmpFlowA.x - radius / cellSizeX) - 1);
+  const maxX = Math.min(FLUID_COLS - 1, Math.ceil(tmpFlowA.x + radius / cellSizeX) + 1);
+  const minY = Math.max(0, Math.floor(tmpFlowA.y - radius / cellSizeY) - 1);
+  const maxY = Math.min(FLUID_ROWS - 1, Math.ceil(tmpFlowA.y + radius / cellSizeY) + 1);
+
+  for (let y = minY; y <= maxY; y++) {
+    const worldCellY = -boundY + (y / Math.max(FLUID_ROWS - 1, 1)) * spanY;
+    for (let x = minX; x <= maxX; x++) {
+      const worldCellX = -boundX + (x / Math.max(FLUID_COLS - 1, 1)) * spanX;
+      const dx = worldCellX - worldX;
+      const dy = worldCellY - worldY;
+      const distSq = dx * dx + dy * dy;
+      if (distSq > radiusSq) continue;
+
+      const falloff = Math.pow(1 - distSq / radiusSq, 2);
+      const dist = Math.sqrt(distSq) + 0.0001;
+      const tangentX = -dy / dist;
+      const tangentY = dx / dist;
+      const cross = dirX * (dy / dist) - dirY * (dx / dist);
+      const curl = cross * speed * strength * 0.46 * falloff;
+      const index = y * FLUID_COLS + x;
+
+      fluidVelocityX[index] += impulseX * falloff + tangentX * curl;
+      fluidVelocityY[index] += impulseY * falloff + tangentY * curl;
+    }
+  }
+}
+
+function stepFluidField(frame) {
+  const boundX = Math.max(viewportBounds.x, 1);
+  const boundY = Math.max(viewportBounds.y, 1);
+  const advectScaleX = ((FLUID_COLS - 1) / (boundX * 2)) * 0.82;
+  const advectScaleY = ((FLUID_ROWS - 1) / (boundY * 2)) * 0.82;
+  const viscosity = 0.16;
+  const damping = Math.pow(0.988 - motionTuning.friction * 0.032, frame);
+  const edgeDamping = 0.88;
+  const swirlStrength = 0.08;
+  const pressureIterations = 7;
+  const projectionStrength = 0.92;
+
+  for (let y = 0; y < FLUID_ROWS; y++) {
+    const upY = Math.max(y - 1, 0);
+    const downY = Math.min(y + 1, FLUID_ROWS - 1);
+    for (let x = 0; x < FLUID_COLS; x++) {
+      const leftX = Math.max(x - 1, 0);
+      const rightX = Math.min(x + 1, FLUID_COLS - 1);
+      const index = y * FLUID_COLS + x;
+      const leftIndex = y * FLUID_COLS + leftX;
+      const rightIndex = y * FLUID_COLS + rightX;
+      const upIndex = upY * FLUID_COLS + x;
+      const downIndex = downY * FLUID_COLS + x;
+
+      const vx = fluidVelocityX[index];
+      const vy = fluidVelocityY[index];
+
+      sampleFluidArrays(
+        x - vx * advectScaleX * frame * 0.88,
+        y - vy * advectScaleY * frame * 0.88,
+        fluidVelocityX,
+        fluidVelocityY,
+        tmpFlowA
+      );
+
+      const avgX = (
+        fluidVelocityX[leftIndex] +
+        fluidVelocityX[rightIndex] +
+        fluidVelocityX[upIndex] +
+        fluidVelocityX[downIndex]
+      ) * 0.25;
+      const avgY = (
+        fluidVelocityY[leftIndex] +
+        fluidVelocityY[rightIndex] +
+        fluidVelocityY[upIndex] +
+        fluidVelocityY[downIndex]
+      ) * 0.25;
+
+      let nextX = tmpFlowA.x + (avgX - tmpFlowA.x) * viscosity;
+      let nextY = tmpFlowA.y + (avgY - tmpFlowA.y) * viscosity;
+
+      nextX += (fluidVelocityY[downIndex] - fluidVelocityY[upIndex]) * swirlStrength * frame;
+      nextY += (fluidVelocityX[leftIndex] - fluidVelocityX[rightIndex]) * swirlStrength * frame;
+
+      if (x === 0 || x === FLUID_COLS - 1 || y === 0 || y === FLUID_ROWS - 1) {
+        nextX *= edgeDamping;
+        nextY *= edgeDamping;
+      }
+
+      nextX *= damping;
+      nextY *= damping;
+
+      fluidVelocityNextX[index] = Math.abs(nextX) < 0.00008 ? 0 : nextX;
+      fluidVelocityNextY[index] = Math.abs(nextY) < 0.00008 ? 0 : nextY;
+    }
+  }
+
+  fluidPressure.fill(0);
+  for (let y = 0; y < FLUID_ROWS; y++) {
+    const upY = Math.max(y - 1, 0);
+    const downY = Math.min(y + 1, FLUID_ROWS - 1);
+    for (let x = 0; x < FLUID_COLS; x++) {
+      const leftX = Math.max(x - 1, 0);
+      const rightX = Math.min(x + 1, FLUID_COLS - 1);
+      const index = y * FLUID_COLS + x;
+      const leftIndex = y * FLUID_COLS + leftX;
+      const rightIndex = y * FLUID_COLS + rightX;
+      const upIndex = upY * FLUID_COLS + x;
+      const downIndex = downY * FLUID_COLS + x;
+
+      fluidDivergence[index] = 0.5 * (
+        fluidVelocityNextX[rightIndex] -
+        fluidVelocityNextX[leftIndex] +
+        fluidVelocityNextY[downIndex] -
+        fluidVelocityNextY[upIndex]
+      );
+    }
+  }
+
+  for (let iteration = 0; iteration < pressureIterations; iteration++) {
+    for (let y = 0; y < FLUID_ROWS; y++) {
+      const upY = Math.max(y - 1, 0);
+      const downY = Math.min(y + 1, FLUID_ROWS - 1);
+      for (let x = 0; x < FLUID_COLS; x++) {
+        const leftX = Math.max(x - 1, 0);
+        const rightX = Math.min(x + 1, FLUID_COLS - 1);
+        const index = y * FLUID_COLS + x;
+        const leftIndex = y * FLUID_COLS + leftX;
+        const rightIndex = y * FLUID_COLS + rightX;
+        const upIndex = upY * FLUID_COLS + x;
+        const downIndex = downY * FLUID_COLS + x;
+
+        fluidPressureNext[index] = (
+          fluidPressure[leftIndex] +
+          fluidPressure[rightIndex] +
+          fluidPressure[upIndex] +
+          fluidPressure[downIndex] -
+          fluidDivergence[index]
+        ) * 0.25;
+      }
+    }
+    [fluidPressure, fluidPressureNext] = [fluidPressureNext, fluidPressure];
+  }
+
+  for (let y = 0; y < FLUID_ROWS; y++) {
+    const upY = Math.max(y - 1, 0);
+    const downY = Math.min(y + 1, FLUID_ROWS - 1);
+    for (let x = 0; x < FLUID_COLS; x++) {
+      const leftX = Math.max(x - 1, 0);
+      const rightX = Math.min(x + 1, FLUID_COLS - 1);
+      const index = y * FLUID_COLS + x;
+      const leftIndex = y * FLUID_COLS + leftX;
+      const rightIndex = y * FLUID_COLS + rightX;
+      const upIndex = upY * FLUID_COLS + x;
+      const downIndex = downY * FLUID_COLS + x;
+
+      fluidVelocityNextX[index] -= (fluidPressure[rightIndex] - fluidPressure[leftIndex]) * 0.5 * projectionStrength;
+      fluidVelocityNextY[index] -= (fluidPressure[downIndex] - fluidPressure[upIndex]) * 0.5 * projectionStrength;
+    }
+  }
+
+  [fluidVelocityX, fluidVelocityNextX] = [fluidVelocityNextX, fluidVelocityX];
+  [fluidVelocityY, fluidVelocityNextY] = [fluidVelocityNextY, fluidVelocityY];
 }
 
 function updatePointerProjection(updateMotion) {
@@ -540,9 +998,13 @@ function updateViewport() {
       particleMaterial.size = isMobileLayout ? 12.8 : 9.8;
     }
 
-    const desiredCount = computeParticleCount(width, height);
-    if (desiredCount !== particleCount) {
+    const desiredCount = motionTuning.particleCount ?? computeParticleCount(width, height);
+    if (!particleSystem || particleCount === 0) {
       buildParticles(desiredCount);
+      syncTuningPanel();
+    } else if (desiredCount !== particleTargetCount) {
+      particleTargetCount = desiredCount;
+      syncTuningPanel();
     }
   }
 }
@@ -572,6 +1034,12 @@ function animate() {
     updatePointerProjection(false);
   }
 
+  if (textReady && particleTargetCount > 0 && particleTargetCount !== particleCount) {
+    const delta = particleTargetCount - particleCount;
+    const step = Math.sign(delta) * Math.min(Math.abs(delta), COUNT_STEP * 2);
+    resizeParticleSystem(particleCount + step);
+  }
+
   pointer.ndcSmooth.lerp(pointer.ndc, pointer.active ? 0.12 : 0.08);
   pointer.velocity.multiplyScalar(pointer.active ? 0.84 : 0.78);
   pointer.speed = pointer.velocity.length();
@@ -591,7 +1059,7 @@ function animate() {
   }
 
   const pointerEnergy = clamp(pointer.speed * 0.075, 0, 8.5);
-  const hitRadius = isMobileLayout ? 20 : 15;
+  const hitRadius = (isMobileLayout ? 17 : 11.5) * motionTuning.radius;
   const hitRadiusSq = hitRadius * hitRadius;
   const rayOriginX = pointer.rayOriginLocal.x;
   const rayOriginY = pointer.rayOriginLocal.y;
@@ -599,6 +1067,18 @@ function animate() {
   const rayDirX = pointer.rayDirLocal.x;
   const rayDirY = pointer.rayDirLocal.y;
   const rayDirZ = pointer.rayDirLocal.z;
+
+  if (pointer.active && pointer.ready && pointerEnergy > 0.0001) {
+    injectFluidImpulse(
+      pointer.local.x,
+      pointer.local.y,
+      pointer.velocity.x,
+      pointer.velocity.y,
+      hitRadius * 0.92,
+      0.72 * frame
+    );
+  }
+  stepFluidField(frame);
 
   if (particleSystem && positionAttr && colorAttr) {
     for (let i = 0; i < particleCount; i++) {
@@ -614,6 +1094,16 @@ function animate() {
       let vx = particleVelocities[o];
       let vy = particleVelocities[o + 1];
       let vz = particleVelocities[o + 2];
+
+      const sampleOffsetX = Math.sin(seed * 11.7 + pz * 0.006 + t * 0.14) * 6;
+      const sampleOffsetY = Math.cos(seed * 13.1 + pz * 0.005 - t * 0.11) * 6;
+      sampleFluidVelocity(px + sampleOffsetX, py + sampleOffsetY, tmpFlowA);
+      const fluidCoupling = (0.31 + particleWake[i] * 0.15) * frame / mass;
+      const fluidRelax = clamp((0.075 + particleWake[i] * 0.03) * frame / mass, 0, 0.19);
+      vx += tmpFlowA.x * fluidCoupling;
+      vy += tmpFlowA.y * fluidCoupling;
+      vx += (tmpFlowA.x - vx) * fluidRelax;
+      vy += (tmpFlowA.y - vy) * fluidRelax;
 
       if (pointer.active && pointer.ready && pointerEnergy > 0.0001) {
         const toParticleX = px - rayOriginX;
@@ -632,29 +1122,24 @@ function animate() {
 
           if (distSq < hitRadiusSq) {
             const dist = Math.sqrt(distSq) || 1;
-            const falloff = 1 - distSq / hitRadiusSq;
+            const falloff = Math.pow(1 - distSq / hitRadiusSq, 2);
             const nx = radialX / dist;
             const ny = radialY / dist;
             const nz = radialZ / dist;
-            const swirlX = rayDirY * nz - rayDirZ * ny;
-            const swirlY = rayDirZ * nx - rayDirX * nz;
-            const swirlZ = rayDirX * ny - rayDirY * nx;
-            const impulse = pointerEnergy * falloff * (1.15 / mass) * 0.026 * frame;
-            const cursorPush = pointer.speed * falloff * (0.9 / mass) * 0.0011 * frame;
+            const depthLift = pointerEnergy * falloff * 0.16 * frame;
 
-            vx += pointer.velocity.x * cursorPush * 12;
-            vy += pointer.velocity.y * cursorPush * 12;
-            vz += (Math.abs(pointer.velocity.x) + Math.abs(pointer.velocity.y)) * cursorPush * 0.9 * (hash(i + 97) - 0.5);
-
-            vx += nx * impulse * 7 + swirlX * impulse * 4;
-            vy += ny * impulse * 7 + swirlY * impulse * 4;
-            vz += nz * impulse * 4 + swirlZ * impulse * 2.5;
+            vx += nx * depthLift * 0.12;
+            vy += ny * depthLift * 0.12;
+            vz += nz * depthLift * 0.46 + (hash(i + 97) - 0.5) * depthLift * 0.22;
             particleColorMix[i] = 1;
             particleWake[i] = 1;
-            tmpV4.copy(letterPalette[Math.floor(hash(i + t * 100.0 + along) * LETTER_COUNT)]);
+            const randomLetterIndex = Math.floor(Math.random() * letterEntries.length);
+            tmpV4.copy(letterEntries[randomLetterIndex].glow.material.color);
+            particleAssignedLetter[i] = randomLetterIndex;
             particleAssignedColors[o] = tmpV4.x;
             particleAssignedColors[o + 1] = tmpV4.y;
             particleAssignedColors[o + 2] = tmpV4.z;
+            particleAssignedIntensity[i] = 1.7;
             particleColors[o] = tmpV4.x;
             particleColors[o + 1] = tmpV4.y;
             particleColors[o + 2] = tmpV4.z;
@@ -678,29 +1163,36 @@ function animate() {
         vz *= 0.84;
       }
 
-      particleWake[i] *= 0.965;
+      particleWake[i] *= 0.956;
       let speed = Math.sqrt(vx * vx + vy * vy + vz * vz);
-      const swirlFactor = particleWake[i] * clamp(speed * 0.12 * turbulence, 0, 0.24) * frame;
-      if (swirlFactor > 0.0001) {
+      const planarSpeed = Math.sqrt(vx * vx + vy * vy);
+      const eddy = particleWake[i] * clamp(planarSpeed * 0.016 * turbulence, 0, 0.085) * frame;
+      if (eddy > 0.0001) {
         const spin = particleSpin[i];
-        const swirlX = -vy * spin;
-        const swirlY = vx * spin;
-        const swirlZ = Math.sin(t * 1.7 + seed * 6.283) * speed * 0.35;
-        vx += swirlX * swirlFactor;
-        vy += swirlY * swirlFactor;
-        vz += swirlZ * swirlFactor * 0.35;
+        const prevVx = vx;
+        const prevVy = vy;
+        vz += Math.sin(t * 1.55 + seed * 6.283) * eddy * 0.42;
+        vx += -prevVy * spin * eddy * 0.08;
+        vy += prevVx * spin * eddy * 0.08;
       }
 
       speed = Math.sqrt(vx * vx + vy * vy + vz * vz);
-      const drag = clamp(0.992 - speed * 0.0016 * frame - particleWake[i] * 0.02 * frame, 0.86, 0.996);
+      const dragBase = 0.994 - motionTuning.friction * 0.018;
+      const dragMin = 0.968 - motionTuning.friction * 0.036;
+      const dragMax = 0.998 - motionTuning.friction * 0.004;
+      const drag = clamp(
+        dragBase - speed * 0.00045 * frame - particleWake[i] * 0.0026 * frame,
+        dragMin,
+        dragMax
+      );
       vx *= drag;
       vy *= drag;
-      vz *= drag;
+      vz *= clamp(drag - 0.008, 0.9, 0.988);
 
       if (speed < 0.0025) {
-        vx *= 0.65;
-        vy *= 0.65;
-        vz *= 0.65;
+        vx *= 0.8;
+        vy *= 0.8;
+        vz *= 0.72;
       }
 
       particlePositions[o] = px + vx * frame;
@@ -713,21 +1205,24 @@ function animate() {
       const assignedR = particleAssignedColors[o];
       const assignedG = particleAssignedColors[o + 1];
       const assignedB = particleAssignedColors[o + 2];
-      const assigned = assignedR >= 0;
+      const assignedLetter = particleAssignedLetter[i];
+      const assigned = assignedLetter >= 0;
       const speedGlow = assigned
-        ? clamp(1.06 + speed * 0.22, 1.06, 1.3)
+        ? clamp(1.18 + speed * 0.28, 1.18, 1.42)
         : clamp(0.68 + speed * 0.1, 0.68, 0.98);
       const whiteMix = assigned
-        ? clamp(0.0 + speed * 0.015, 0.0, 0.03)
+        ? clamp(0.0 + speed * 0.01, 0.0, 0.02)
         : clamp(0.05 + speed * 0.05, 0.05, 0.14);
-      const baseR = assignedR >= 0 ? assignedR : TEAL.r;
-      const baseG = assignedG >= 0 ? assignedG : TEAL.g;
-      const baseB = assignedB >= 0 ? assignedB : TEAL.b;
+      const sourceColor = assigned ? letterPalette[assignedLetter] : null;
+      const baseR = assigned ? sourceColor.r : (assignedR >= 0 ? assignedR : TEAL.r);
+      const baseG = assigned ? sourceColor.g : (assignedG >= 0 ? assignedG : TEAL.g);
+      const baseB = assigned ? sourceColor.b : (assignedB >= 0 ? assignedB : TEAL.b);
       if (assigned) {
+        const intensity = particleAssignedIntensity[i];
         const pulse = 1 + Math.sin(pulseTime * 8 + seed * 9) * 0.04;
-        particleColors[o] = Math.min(1, baseR * speedGlow * pulse * (1 - whiteMix) + whiteMix);
-        particleColors[o + 1] = Math.min(1, baseG * speedGlow * pulse * (1 - whiteMix) + whiteMix);
-        particleColors[o + 2] = Math.min(1, baseB * speedGlow * pulse * (1 - whiteMix) + whiteMix);
+        particleColors[o] = Math.min(1, baseR * intensity * speedGlow * pulse + whiteMix);
+        particleColors[o + 1] = Math.min(1, baseG * intensity * speedGlow * pulse + whiteMix);
+        particleColors[o + 2] = Math.min(1, baseB * intensity * speedGlow * pulse + whiteMix);
       } else {
         particleColors[o] = baseR * speedGlow * (1 - whiteMix) + whiteMix;
         particleColors[o + 1] = baseG * speedGlow * (1 - whiteMix) + whiteMix;
@@ -786,6 +1281,8 @@ if (typeof ResizeObserver !== "undefined") {
   const ro = new ResizeObserver(scheduleViewportUpdate);
   ro.observe(container);
 }
+
+setupTuningPanel();
 
 init().catch((error) => {
   console.error("[hanelab] Failed to initialize scene.", error);
