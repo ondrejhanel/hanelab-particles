@@ -8,6 +8,19 @@ import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
 import { UnrealBloomPass } from "three/addons/postprocessing/UnrealBloomPass.js";
 import { mergeGeometries } from "three/addons/utils/BufferGeometryUtils.js";
 
+const GPUIO_API = globalThis.GPUIO;
+if (!GPUIO_API) throw new Error("Missing GPUIO global");
+const {
+  GPUComposer,
+  GPUProgram,
+  GPULayer,
+  FLOAT,
+  INT,
+  LINEAR,
+  NEAREST,
+  CLAMP_TO_EDGE
+} = GPUIO_API;
+
 const FONT_URL = "./_Assets/Monoton-Regular.ttf";
 const WORDMARK = "hanelab";
 const LETTER_COUNT = WORDMARK.length;
@@ -18,7 +31,7 @@ const BG_COLOR = 0x020707;
 const REFERENCE_AREA = 1440 * 900;
 const BASE_PARTICLES = 3000;
 const MIN_PARTICLES = 1600;
-const MAX_PARTICLES = 1000000;
+const MAX_PARTICLES = 100000;
 const WORDMARK_DISPLAY_SCALE = 0.4;
 const WORDMARK_DEPTH_OFFSET = -18;
 const COUNT_STEP = 100;
@@ -51,12 +64,25 @@ const CORNER_REPEL_FORCE = 0.5;
 const CORNER_REPEL_DAMP = 0.12;
 const CORNER_REPEL_JITTER = 0.4;
 const PARTICLE_HIT_COOLDOWN = 0.22;
-const PARTICLE_HIT_FLASH = 64;
-const PARTICLE_HIT_FLASH_EXTRA = 18;
+const PARTICLE_HIT_FLASH = 4.8;
+const PARTICLE_HIT_FLASH_EXTRA = 1.6;
 const PARTICLE_GLOW_BASE = 0.62;
 const PARTICLE_GLOW_WAKE = 0.34;
 const PARTICLE_GLOW_SPEED = 0.016;
-const PARTICLE_HIT_FADE_TIME = 5;
+const PARTICLE_HIT_FADE_TIME = 1.7;
+const PARTICLE_COLOR_FADE_TIME = 3.8;
+const PARTICLE_INTENSITY_MAX = 4.6;
+const PARTICLE_GLOW_BOOST_MAX = 3.4;
+const PARTICLE_COLOR_CHANNEL_MAX = 1.14;
+const FLUID_IMPULSE_STRENGTH = 0.22;
+const FLUID_COUPLING_BASE = 0.06;
+const FLUID_COUPLING_WAKE = 0.2;
+const FLUID_RELAX_BASE = 0.014;
+const FLUID_RELAX_WAKE = 0.05;
+const FLUID_JACOBI_STEPS = 4;
+const FLUID_MAX_VELOCITY = 36;
+const FLUID_SAMPLE_SCALE = 0.22;
+const FLUID_MIN_IMPULSE_PX = 12;
 
 const container = document.getElementById("app");
 if (!container) throw new Error("Missing #app container");
@@ -156,6 +182,7 @@ let fluidVelocityNextY = new Float32Array(FLUID_CELL_COUNT);
 let fluidPressure = new Float32Array(FLUID_CELL_COUNT);
 let fluidPressureNext = new Float32Array(FLUID_CELL_COUNT);
 let fluidDivergence = new Float32Array(FLUID_CELL_COUNT);
+let gpuFluid = null;
 let positionAttr = null;
 let colorAttr = null;
 let sizeVarianceAttr = null;
@@ -178,10 +205,12 @@ const pointer = {
   ndcSmooth: new THREE.Vector2(),
   local: new THREE.Vector3(),
   velocity: new THREE.Vector3(),
+  screen: new THREE.Vector2(),
   rayOriginLocal: new THREE.Vector3(),
   rayDirLocal: new THREE.Vector3(0, 0, -1),
   speed: 0
 };
+const pendingFluidImpulses = [];
 
 const tmpV1 = new THREE.Vector3();
 const tmpV2 = new THREE.Vector3();
@@ -378,6 +407,14 @@ function normalizeParticleSizeRandomness(value) {
 
 function getBaseParticleSize() {
   return isMobileLayout ? 12.8 : 9.8;
+}
+
+function getEffectiveFriction() {
+  return clamp(
+    motionTuning.friction * (0.5 + motionTuning.friction * 0.5),
+    FRICTION_MIN * 0.5,
+    FRICTION_MAX
+  );
 }
 
 function updateParticleMaterialTuning() {
@@ -637,13 +674,46 @@ function createParticleSpriteTexture(sizePx) {
   if (!ctx) throw new Error("Could not create canvas context");
 
   ctx.clearRect(0, 0, sizePx, sizePx);
-  ctx.fillStyle = "#ffffff";
+  const center = sizePx * 0.5;
+  const radius = sizePx * 0.46;
+
+  const shadow = ctx.createRadialGradient(
+    center,
+    center,
+    sizePx * 0.06,
+    center,
+    center,
+    radius
+  );
+  shadow.addColorStop(0, "rgba(255,255,255,1)");
+  shadow.addColorStop(0.2, "rgba(255,255,255,0.98)");
+  shadow.addColorStop(0.55, "rgba(255,255,255,0.72)");
+  shadow.addColorStop(0.82, "rgba(255,255,255,0.18)");
+  shadow.addColorStop(1, "rgba(255,255,255,0)");
+  ctx.fillStyle = shadow;
   ctx.beginPath();
-  ctx.arc(sizePx * 0.5, sizePx * 0.5, sizePx * 0.34, 0, Math.PI * 2);
+  ctx.arc(center, center, radius, 0, Math.PI * 2);
+  ctx.fill();
+
+  const highlight = ctx.createRadialGradient(
+    center - sizePx * 0.12,
+    center - sizePx * 0.14,
+    0,
+    center - sizePx * 0.12,
+    center - sizePx * 0.14,
+    sizePx * 0.24
+  );
+  highlight.addColorStop(0, "rgba(255,255,255,0.92)");
+  highlight.addColorStop(0.45, "rgba(255,255,255,0.34)");
+  highlight.addColorStop(1, "rgba(255,255,255,0)");
+  ctx.fillStyle = highlight;
+  ctx.beginPath();
+  ctx.arc(center, center, radius, 0, Math.PI * 2);
   ctx.fill();
 
   const texture = new THREE.CanvasTexture(canvas);
   texture.colorSpace = THREE.SRGBColorSpace;
+  texture.needsUpdate = true;
   return texture;
 }
 
@@ -884,8 +954,8 @@ function ensureParticleMaterial() {
     map: particleSprite,
     color: 0xffffff,
     transparent: true,
-    opacity: 1,
-    alphaTest: 0.82,
+    opacity: 0.76,
+    alphaTest: 0.06,
     blending: THREE.AdditiveBlending,
     depthWrite: false,
     sizeAttenuation: true,
@@ -948,7 +1018,7 @@ function spawnParticleAt(index, sampler, shellRadius, fieldX, fieldY, fieldZ) {
   particleWake[index] = 0;
   particleHitCooldown[index] = 0;
   particleSizeVariance[index] = Math.random();
-  particleAssignedIntensity[index] = PARTICLE_GLOW_BASE;
+  particleAssignedIntensity[index] = 0;
   particleAssignedLetter[index] = -1;
   particleSpin[index] = Math.random() < 0.5 ? -1 : 1;
   particleAssignedColors[o] = -1;
@@ -996,17 +1066,33 @@ function spawnParticleAt(index, sampler, shellRadius, fieldX, fieldY, fieldZ) {
   particleColors[o + 2] = TEAL.b * (1 - whiteMix) + whiteMix;
 }
 
+function resetParticleInteractionState(count, resetVelocity = false) {
+  clearFluidField();
+
+  for (let i = 0; i < count; i++) {
+    const o = i * 3;
+    particleColorMix[i] = 0;
+    particleWake[i] = 0;
+    particleHitCooldown[i] = 0;
+    particleAssignedIntensity[i] = 0;
+    particleAssignedLetter[i] = -1;
+    particleAssignedColors[o] = -1;
+    particleAssignedColors[o + 1] = -1;
+    particleAssignedColors[o + 2] = -1;
+
+    if (resetVelocity) {
+      particleVelocities[o] = 0;
+      particleVelocities[o + 1] = 0;
+      particleVelocities[o + 2] = 0;
+    }
+  }
+}
+
 function buildParticles(count) {
   if (!textGeometry || !textMesh) return;
 
   disposeParticles();
-  fluidVelocityX.fill(0);
-  fluidVelocityY.fill(0);
-  fluidVelocityNextX.fill(0);
-  fluidVelocityNextY.fill(0);
-  fluidPressure.fill(0);
-  fluidPressureNext.fill(0);
-  fluidDivergence.fill(0);
+  clearFluidField();
 
   particleCount = count;
   particleTargetCount = count;
@@ -1109,6 +1195,7 @@ function resizeParticleSystem(nextCount) {
     }
   }
 
+  resetParticleInteractionState(targetCount, true);
   particleCount = targetCount;
   rebuildParticleGeometry();
 }
@@ -1155,183 +1242,314 @@ function sampleFluidVelocity(worldX, worldY, target) {
   return sampleFluidArrays(tmpFlowB.x, tmpFlowB.y, fluidVelocityX, fluidVelocityY, target);
 }
 
-function injectFluidImpulse(worldX, worldY, velocityX, velocityY, radius, strength) {
-  const speed = Math.hypot(velocityX, velocityY);
-  if (speed < 0.001) return;
-
-  const boundX = Math.max(viewportBounds.x, 1);
-  const boundY = Math.max(viewportBounds.y, 1);
-  const spanX = boundX * 2;
-  const spanY = boundY * 2;
-  const cellSizeX = spanX / Math.max(FLUID_COLS - 1, 1);
-  const cellSizeY = spanY / Math.max(FLUID_ROWS - 1, 1);
-  const radiusSq = radius * radius;
-  const impulseX = velocityX * strength;
-  const impulseY = velocityY * strength;
-  const dirX = velocityX / speed;
-  const dirY = velocityY / speed;
-
-  toFluidGridPosition(worldX, worldY, tmpFlowA);
-  const minX = Math.max(0, Math.floor(tmpFlowA.x - radius / cellSizeX) - 1);
-  const maxX = Math.min(FLUID_COLS - 1, Math.ceil(tmpFlowA.x + radius / cellSizeX) + 1);
-  const minY = Math.max(0, Math.floor(tmpFlowA.y - radius / cellSizeY) - 1);
-  const maxY = Math.min(FLUID_ROWS - 1, Math.ceil(tmpFlowA.y + radius / cellSizeY) + 1);
-
-  for (let y = minY; y <= maxY; y++) {
-    const worldCellY = -boundY + (y / Math.max(FLUID_ROWS - 1, 1)) * spanY;
-    for (let x = minX; x <= maxX; x++) {
-      const worldCellX = -boundX + (x / Math.max(FLUID_COLS - 1, 1)) * spanX;
-      const dx = worldCellX - worldX;
-      const dy = worldCellY - worldY;
-      const distSq = dx * dx + dy * dy;
-      if (distSq > radiusSq) continue;
-
-      const falloff = Math.pow(1 - distSq / radiusSq, 2);
-      const dist = Math.sqrt(distSq) + 0.0001;
-      const tangentX = -dy / dist;
-      const tangentY = dx / dist;
-      const cross = dirX * (dy / dist) - dirY * (dx / dist);
-      const curl = cross * speed * strength * 0.46 * falloff;
-      const index = y * FLUID_COLS + x;
-
-      fluidVelocityX[index] += impulseX * falloff + tangentX * curl;
-      fluidVelocityY[index] += impulseY * falloff + tangentY * curl;
-    }
-  }
+function getFluidCanvasMetrics() {
+  const rect = renderer.domElement.getBoundingClientRect();
+  return {
+    width: Math.max(1, rect.width || renderer.domElement.clientWidth || 1),
+    height: Math.max(1, rect.height || renderer.domElement.clientHeight || 1)
+  };
 }
 
-function stepFluidField(frame) {
-  const boundX = Math.max(viewportBounds.x, 1);
-  const boundY = Math.max(viewportBounds.y, 1);
-  const advectScaleX = ((FLUID_COLS - 1) / (boundX * 2)) * 0.82;
-  const advectScaleY = ((FLUID_ROWS - 1) / (boundY * 2)) * 0.82;
-  const viscosity = 0.11;
-  const damping = Math.pow(0.988 - motionTuning.friction * 0.032, frame);
-  const edgeDamping = 0.9;
-  const swirlStrength = 0.11;
-  const pressureIterations = 8;
-  const projectionStrength = 0.92;
-  for (let y = 0; y < FLUID_ROWS; y++) {
-    const upY = Math.max(y - 1, 0);
-    const downY = Math.min(y + 1, FLUID_ROWS - 1);
-    for (let x = 0; x < FLUID_COLS; x++) {
-      const leftX = Math.max(x - 1, 0);
-      const rightX = Math.min(x + 1, FLUID_COLS - 1);
-      const index = y * FLUID_COLS + x;
-      const leftIndex = y * FLUID_COLS + leftX;
-      const rightIndex = y * FLUID_COLS + rightX;
-      const upIndex = upY * FLUID_COLS + x;
-      const downIndex = downY * FLUID_COLS + x;
+function getFluidImpulseThickness() {
+  const { width, height } = getFluidCanvasMetrics();
+  const hitRadius = getMaxCursorRadius() * motionTuning.radius;
+  const scaleX = width / Math.max(viewportBounds.x * 2, 1);
+  const scaleY = height / Math.max(viewportBounds.y * 2, 1);
+  return Math.max(FLUID_MIN_IMPULSE_PX, hitRadius * (scaleX + scaleY) * 0.5);
+}
 
-      const vx = fluidVelocityX[index];
-      const vy = fluidVelocityY[index];
+function createGPUFluidController() {
+  const gpuComposer = GPUComposer.initWithThreeRenderer(renderer);
+  gpuComposer.undoThreeState();
 
-      sampleFluidArrays(
-        x - vx * advectScaleX * frame * 0.88,
-        y - vy * advectScaleY * frame * 0.88,
-        fluidVelocityX,
-        fluidVelocityY,
-        tmpFlowA
-      );
+  const velocityState = new GPULayer(gpuComposer, {
+    name: "velocity",
+    dimensions: [FLUID_COLS, FLUID_ROWS],
+    type: FLOAT,
+    filter: LINEAR,
+    numComponents: 2,
+    wrapX: CLAMP_TO_EDGE,
+    wrapY: CLAMP_TO_EDGE,
+    numBuffers: 2
+  });
+  const divergenceState = new GPULayer(gpuComposer, {
+    name: "divergence",
+    dimensions: [FLUID_COLS, FLUID_ROWS],
+    type: FLOAT,
+    filter: NEAREST,
+    numComponents: 1,
+    wrapX: CLAMP_TO_EDGE,
+    wrapY: CLAMP_TO_EDGE
+  });
+  const pressureState = new GPULayer(gpuComposer, {
+    name: "pressure",
+    dimensions: [FLUID_COLS, FLUID_ROWS],
+    type: FLOAT,
+    filter: NEAREST,
+    numComponents: 1,
+    wrapX: CLAMP_TO_EDGE,
+    wrapY: CLAMP_TO_EDGE,
+    numBuffers: 2
+  });
 
-      const avgX = (
-        fluidVelocityX[leftIndex] +
-        fluidVelocityX[rightIndex] +
-        fluidVelocityX[upIndex] +
-        fluidVelocityX[downIndex]
-      ) * 0.25;
-      const avgY = (
-        fluidVelocityY[leftIndex] +
-        fluidVelocityY[rightIndex] +
-        fluidVelocityY[upIndex] +
-        fluidVelocityY[downIndex]
-      ) * 0.25;
+  const advection = new GPUProgram(gpuComposer, {
+    name: "advection",
+    fragmentShader: `
+      in vec2 v_uv;
 
-      let nextX = tmpFlowA.x + (avgX - tmpFlowA.x) * viscosity;
-      let nextY = tmpFlowA.y + (avgY - tmpFlowA.y) * viscosity;
+      uniform sampler2D u_state;
+      uniform sampler2D u_velocity;
+      uniform vec2 u_dimensions;
+      uniform float u_decay;
 
-      nextX += (fluidVelocityY[downIndex] - fluidVelocityY[upIndex]) * swirlStrength * frame;
-      nextY += (fluidVelocityX[leftIndex] - fluidVelocityX[rightIndex]) * swirlStrength * frame;
+      out vec2 out_state;
 
-      if (x === 0 || x === FLUID_COLS - 1 || y === 0 || y === FLUID_ROWS - 1) {
-        nextX *= edgeDamping;
-        nextY *= edgeDamping;
-      }
+      void main() {
+        vec2 advected = texture(u_state, v_uv - texture(u_velocity, v_uv).xy / u_dimensions).xy;
+        out_state = advected * u_decay;
+      }`,
+    uniforms: [
+      { name: "u_state", value: 0, type: INT },
+      { name: "u_velocity", value: 1, type: INT },
+      { name: "u_dimensions", value: [1, 1], type: FLOAT },
+      { name: "u_decay", value: 0.985, type: FLOAT }
+    ]
+  });
+  const divergence2D = new GPUProgram(gpuComposer, {
+    name: "divergence2D",
+    fragmentShader: `
+      in vec2 v_uv;
 
-      nextX *= damping;
-      nextY *= damping;
+      uniform sampler2D u_vectorField;
+      uniform vec2 u_pxSize;
 
-      fluidVelocityNextX[index] = Math.abs(nextX) < 0.00008 ? 0 : nextX;
-      fluidVelocityNextY[index] = Math.abs(nextY) < 0.00008 ? 0 : nextY;
+      out float out_divergence;
+
+      void main() {
+        float n = texture(u_vectorField, v_uv + vec2(0.0, u_pxSize.y)).y;
+        float s = texture(u_vectorField, v_uv - vec2(0.0, u_pxSize.y)).y;
+        float e = texture(u_vectorField, v_uv + vec2(u_pxSize.x, 0.0)).x;
+        float w = texture(u_vectorField, v_uv - vec2(u_pxSize.x, 0.0)).x;
+        out_divergence = 0.5 * (e - w + n - s);
+      }`,
+    uniforms: [
+      { name: "u_vectorField", value: 0, type: INT },
+      { name: "u_pxSize", value: [1 / FLUID_COLS, 1 / FLUID_ROWS], type: FLOAT }
+    ]
+  });
+  const jacobi = new GPUProgram(gpuComposer, {
+    name: "jacobi",
+    fragmentShader: `
+      in vec2 v_uv;
+
+      uniform float u_alpha;
+      uniform float u_beta;
+      uniform vec2 u_pxSize;
+      uniform sampler2D u_previousState;
+      uniform sampler2D u_divergence;
+
+      out float out_pressure;
+
+      void main() {
+        float n = texture(u_previousState, v_uv + vec2(0.0, u_pxSize.y)).x;
+        float s = texture(u_previousState, v_uv - vec2(0.0, u_pxSize.y)).x;
+        float e = texture(u_previousState, v_uv + vec2(u_pxSize.x, 0.0)).x;
+        float w = texture(u_previousState, v_uv - vec2(u_pxSize.x, 0.0)).x;
+        float d = texture(u_divergence, v_uv).x;
+        out_pressure = (n + s + e + w - d) * 0.25;
+      }`,
+    uniforms: [
+      { name: "u_alpha", value: -1, type: FLOAT },
+      { name: "u_beta", value: 0.25, type: FLOAT },
+      { name: "u_pxSize", value: [1 / FLUID_COLS, 1 / FLUID_ROWS], type: FLOAT },
+      { name: "u_previousState", value: 0, type: INT },
+      { name: "u_divergence", value: 1, type: INT }
+    ]
+  });
+  const gradientSubtraction = new GPUProgram(gpuComposer, {
+    name: "gradientSubtraction",
+    fragmentShader: `
+      in vec2 v_uv;
+
+      uniform vec2 u_pxSize;
+      uniform sampler2D u_scalarField;
+      uniform sampler2D u_vectorField;
+
+      out vec2 out_result;
+
+      void main() {
+        float n = texture(u_scalarField, v_uv + vec2(0.0, u_pxSize.y)).x;
+        float s = texture(u_scalarField, v_uv - vec2(0.0, u_pxSize.y)).x;
+        float e = texture(u_scalarField, v_uv + vec2(u_pxSize.x, 0.0)).x;
+        float w = texture(u_scalarField, v_uv - vec2(u_pxSize.x, 0.0)).x;
+        out_result = texture(u_vectorField, v_uv).xy - 0.5 * vec2(e - w, n - s);
+      }`,
+    uniforms: [
+      { name: "u_pxSize", value: [1 / FLUID_COLS, 1 / FLUID_ROWS], type: FLOAT },
+      { name: "u_scalarField", value: 0, type: INT },
+      { name: "u_vectorField", value: 1, type: INT }
+    ]
+  });
+  const touch = new GPUProgram(gpuComposer, {
+    name: "touch",
+    fragmentShader: `
+      in vec2 v_uv;
+      in vec2 v_uv_local;
+
+      uniform sampler2D u_velocity;
+      uniform vec2 u_vector;
+
+      out vec2 out_velocity;
+
+      void main() {
+        vec2 radialVec = v_uv_local * 2.0 - 1.0;
+        float radiusSq = dot(radialVec, radialVec);
+        float falloff = max(0.0, 1.0 - radiusSq);
+        vec2 velocity = texture(u_velocity, v_uv).xy + falloff * u_vector;
+        float velocityMag = length(velocity);
+        out_velocity = velocityMag > 0.00001
+          ? velocity / velocityMag * min(velocityMag, ${FLUID_MAX_VELOCITY.toFixed(1)})
+          : vec2(0.0);
+      }`,
+    uniforms: [
+      { name: "u_velocity", value: 0, type: INT },
+      { name: "u_vector", value: [0, 0], type: FLOAT }
+    ]
+  });
+
+  function updateDimensions() {
+    const { width, height } = getFluidCanvasMetrics();
+    const effectiveFriction = getEffectiveFriction();
+    advection.setUniform("u_dimensions", [width, height]);
+    advection.setUniform("u_decay", Math.max(0.9, 0.988 - effectiveFriction * 0.03));
+  }
+
+  function syncReadback() {
+    const values = velocityState.getValues();
+    const { width, height } = getFluidCanvasMetrics();
+    const scaleX = (viewportBounds.x * 2) / width * FLUID_SAMPLE_SCALE;
+    const scaleY = (viewportBounds.y * 2) / height * FLUID_SAMPLE_SCALE;
+
+    for (let i = 0; i < FLUID_CELL_COUNT; i++) {
+      const offset = i * 2;
+      fluidVelocityX[i] = values[offset] * scaleX;
+      fluidVelocityY[i] = values[offset + 1] * scaleY;
     }
   }
 
-  fluidPressure.fill(0);
-  for (let y = 0; y < FLUID_ROWS; y++) {
-    const upY = Math.max(y - 1, 0);
-    const downY = Math.min(y + 1, FLUID_ROWS - 1);
-    for (let x = 0; x < FLUID_COLS; x++) {
-      const leftX = Math.max(x - 1, 0);
-      const rightX = Math.min(x + 1, FLUID_COLS - 1);
-      const index = y * FLUID_COLS + x;
-      const leftIndex = y * FLUID_COLS + leftX;
-      const rightIndex = y * FLUID_COLS + rightX;
-      const upIndex = upY * FLUID_COLS + x;
-      const downIndex = downY * FLUID_COLS + x;
-
-      fluidDivergence[index] = 0.5 * (
-        fluidVelocityNextX[rightIndex] -
-        fluidVelocityNextX[leftIndex] +
-        fluidVelocityNextY[downIndex] -
-        fluidVelocityNextY[upIndex]
-      );
-    }
+  function clear() {
+    gpuComposer.undoThreeState();
+    velocityState.clear(true);
+    divergenceState.clear();
+    pressureState.clear(true);
+    fluidVelocityX.fill(0);
+    fluidVelocityY.fill(0);
+    gpuComposer.resetThreeState();
   }
 
-  for (let iteration = 0; iteration < pressureIterations; iteration++) {
-    for (let y = 0; y < FLUID_ROWS; y++) {
-      const upY = Math.max(y - 1, 0);
-      const downY = Math.min(y + 1, FLUID_ROWS - 1);
-      for (let x = 0; x < FLUID_COLS; x++) {
-        const leftX = Math.max(x - 1, 0);
-        const rightX = Math.min(x + 1, FLUID_COLS - 1);
-        const index = y * FLUID_COLS + x;
-        const leftIndex = y * FLUID_COLS + leftX;
-        const rightIndex = y * FLUID_COLS + rightX;
-        const upIndex = upY * FLUID_COLS + x;
-        const downIndex = downY * FLUID_COLS + x;
+  function step() {
+    gpuComposer.undoThreeState();
+    updateDimensions();
 
-        fluidPressureNext[index] = (
-          fluidPressure[leftIndex] +
-          fluidPressure[rightIndex] +
-          fluidPressure[upIndex] +
-          fluidPressure[downIndex] -
-          fluidDivergence[index]
-        ) * 0.25;
-      }
+    while (pendingFluidImpulses.length > 0) {
+      const impulse = pendingFluidImpulses.shift();
+      if (!impulse) break;
+      touch.setUniform("u_vector", [
+        impulse.vector[0] * FLUID_IMPULSE_STRENGTH,
+        impulse.vector[1] * FLUID_IMPULSE_STRENGTH
+      ]);
+      gpuComposer.stepSegment({
+        program: touch,
+        input: velocityState,
+        output: velocityState,
+        position1: impulse.position1,
+        position2: impulse.position2,
+        thickness: impulse.thickness,
+        endCaps: true
+      });
     }
-    [fluidPressure, fluidPressureNext] = [fluidPressureNext, fluidPressure];
+
+    gpuComposer.step({
+      program: advection,
+      input: [velocityState, velocityState],
+      output: velocityState
+    });
+    gpuComposer.step({
+      program: divergence2D,
+      input: velocityState,
+      output: divergenceState
+    });
+    for (let i = 0; i < FLUID_JACOBI_STEPS; i++) {
+      gpuComposer.step({
+        program: jacobi,
+        input: [pressureState, divergenceState],
+        output: pressureState
+      });
+    }
+    gpuComposer.step({
+      program: gradientSubtraction,
+      input: [pressureState, velocityState],
+      output: velocityState
+    });
+
+    syncReadback();
+    gpuComposer.resetThreeState();
   }
 
-  for (let y = 0; y < FLUID_ROWS; y++) {
-    const upY = Math.max(y - 1, 0);
-    const downY = Math.min(y + 1, FLUID_ROWS - 1);
-    for (let x = 0; x < FLUID_COLS; x++) {
-      const leftX = Math.max(x - 1, 0);
-      const rightX = Math.min(x + 1, FLUID_COLS - 1);
-      const index = y * FLUID_COLS + x;
-      const leftIndex = y * FLUID_COLS + leftX;
-      const rightIndex = y * FLUID_COLS + rightX;
-      const upIndex = upY * FLUID_COLS + x;
-      const downIndex = downY * FLUID_COLS + x;
-
-      fluidVelocityNextX[index] -= (fluidPressure[rightIndex] - fluidPressure[leftIndex]) * 0.5 * projectionStrength;
-      fluidVelocityNextY[index] -= (fluidPressure[downIndex] - fluidPressure[upIndex]) * 0.5 * projectionStrength;
-    }
+  function dispose() {
+    velocityState.dispose();
+    divergenceState.dispose();
+    pressureState.dispose();
+    advection.dispose();
+    divergence2D.dispose();
+    jacobi.dispose();
+    gradientSubtraction.dispose();
+    touch.dispose();
+    gpuComposer.dispose();
   }
 
-  [fluidVelocityX, fluidVelocityNextX] = [fluidVelocityNextX, fluidVelocityX];
-  [fluidVelocityY, fluidVelocityNextY] = [fluidVelocityNextY, fluidVelocityY];
+  updateDimensions();
+  clear();
+
+  return {
+    clear,
+    dispose,
+    step,
+    updateDimensions
+  };
+}
+
+function clearFluidField() {
+  pendingFluidImpulses.length = 0;
+  if (gpuFluid) {
+    gpuFluid.clear();
+    return;
+  }
+  fluidVelocityX.fill(0);
+  fluidVelocityY.fill(0);
+}
+
+function queueFluidImpulse(position1, position2) {
+  const dx = position2[0] - position1[0];
+  const dy = position2[1] - position1[1];
+  if (dx * dx + dy * dy < 0.0001) return;
+  pendingFluidImpulses.push({
+    position1,
+    position2,
+    vector: [dx, dy],
+    thickness: getFluidImpulseThickness()
+  });
+}
+
+function stepFluidField() {
+  if (!gpuFluid) return;
+  gpuFluid.step();
+}
+
+function updateFluidSimulationSize() {
+  if (!gpuFluid) return;
+  gpuFluid.updateDimensions();
+  clearFluidField();
 }
 
 function updatePointerProjection(updateMotion) {
@@ -1371,6 +1589,7 @@ function updateViewport() {
   renderer.setSize(width, height, false);
   composer.setSize(width, height);
   bloomPass.setSize(width, height);
+  updateFluidSimulationSize();
 
   camera.aspect = width / height;
   camera.fov = isMobileLayout ? 37 : 33;
@@ -1478,17 +1697,7 @@ function animate() {
     cursorSphere.scale.setScalar(hitRadius);
   }
 
-  if (pointer.active && pointer.ready && pointerEnergy > 0.0001 && hitRadius > 0.001) {
-    injectFluidImpulse(
-      pointerLocalX,
-      pointerLocalY,
-      pointer.velocity.x,
-      pointer.velocity.y,
-      hitRadius * 0.92,
-      0.72 * frame
-    );
-  }
-  stepFluidField(frame);
+  stepFluidField();
 
   if (particleSystem && positionAttr && colorAttr) {
     for (let i = 0; i < particleCount; i++) {
@@ -1515,8 +1724,19 @@ function animate() {
       sampleFluidVelocity(px + sampleOffsetX, py + sampleOffsetY, tmpFlowA);
       sampleFluidVelocity(px - sampleOffsetY * 0.45, py + sampleOffsetX * 0.45, tmpFlowB);
       tmpFlowA.lerp(tmpFlowB, 0.35);
-      const fluidCoupling = (0.31 + particleWake[i] * 0.15) * frame / mass;
-      const fluidRelax = clamp((0.075 + particleWake[i] * 0.03) * frame / mass, 0, 0.19);
+      const hitInfluence = Math.max(particleColorMix[i], clamp(particleWake[i], 0, 1));
+      const fluidCoupling = (
+        FLUID_COUPLING_BASE +
+        hitInfluence * FLUID_COUPLING_WAKE
+      ) * frame / mass;
+      const fluidRelax = clamp(
+        (
+          FLUID_RELAX_BASE +
+          hitInfluence * FLUID_RELAX_WAKE
+        ) * frame / mass,
+        0,
+        0.12
+      );
       vx += tmpFlowA.x * fluidCoupling;
       vy += tmpFlowA.y * fluidCoupling;
       vx += (tmpFlowA.x - vx) * fluidRelax;
@@ -1557,6 +1777,7 @@ function animate() {
               particleAssignedIntensity[i],
               PARTICLE_HIT_FLASH + falloff * PARTICLE_HIT_FLASH_EXTRA + pointerEnergy * 0.12
             );
+            particleAssignedIntensity[i] = Math.min(particleAssignedIntensity[i], PARTICLE_INTENSITY_MAX);
           }
         }
       }
@@ -1581,7 +1802,7 @@ function animate() {
 
       particleWake[i] *= 0.956;
       const hitFadeAlpha = 1 - Math.exp(-dt / PARTICLE_HIT_FADE_TIME);
-      particleColorMix[i] += (0 - particleColorMix[i]) * hitFadeAlpha;
+      particleColorMix[i] = Math.max(0, particleColorMix[i] - dt / PARTICLE_COLOR_FADE_TIME);
       let speed = Math.sqrt(vx * vx + vy * vy + vz * vz);
       const planarSpeed = Math.sqrt(vx * vx + vy * vy);
       const eddy = particleWake[i] * clamp(planarSpeed * 0.016 * turbulence, 0, 0.085) * frame;
@@ -1595,9 +1816,10 @@ function animate() {
       }
 
       speed = Math.sqrt(vx * vx + vy * vy + vz * vz);
-      const dragBase = 0.994 - motionTuning.friction * 0.018;
-      const dragMin = 0.968 - motionTuning.friction * 0.036;
-      const dragMax = 0.998 - motionTuning.friction * 0.004;
+      const effectiveFriction = getEffectiveFriction();
+      const dragBase = 0.994 - effectiveFriction * 0.018;
+      const dragMin = 0.968 - effectiveFriction * 0.036;
+      const dragMax = 0.998 - effectiveFriction * 0.004;
       const drag = clamp(
         dragBase - speed * 0.00045 * frame - particleWake[i] * 0.0026 * frame,
         dragMin,
@@ -1623,15 +1845,19 @@ function animate() {
       const assignedR = particleAssignedColors[o];
       const assignedG = particleAssignedColors[o + 1];
       const assignedB = particleAssignedColors[o + 2];
+      const hasAssignedColor = assignedR >= 0 && assignedG >= 0 && assignedB >= 0;
       const glowTarget = PARTICLE_GLOW_BASE +
         particleWake[i] * PARTICLE_GLOW_WAKE +
         clamp(speed * PARTICLE_GLOW_SPEED, 0, 0.38);
-      particleAssignedIntensity[i] += (glowTarget - particleAssignedIntensity[i]) * hitFadeAlpha;
+      particleAssignedIntensity[i] += (0 - particleAssignedIntensity[i]) * hitFadeAlpha;
+      particleAssignedIntensity[i] = clamp(particleAssignedIntensity[i], 0, PARTICLE_INTENSITY_MAX);
+      const emissionMix = clamp(particleAssignedIntensity[i] / PARTICLE_INTENSITY_MAX, 0, 1);
 
       if (
-        particleAssignedLetter[i] >= 0 &&
-        particleColorMix[i] < 0.004 &&
-        particleAssignedIntensity[i] <= glowTarget + 0.04
+        hasAssignedColor &&
+        particleColorMix[i] <= 0.0001 &&
+        emissionMix <= 0.002 &&
+        particleWake[i] <= 0.01
       ) {
         particleAssignedLetter[i] = -1;
         particleAssignedColors[o] = -1;
@@ -1639,25 +1865,28 @@ function animate() {
         particleAssignedColors[o + 2] = -1;
       }
 
-      const inheritedMix = particleAssignedLetter[i] >= 0 ? particleColorMix[i] : 0;
-      const hitActive = inheritedMix > 0.001 || particleAssignedIntensity[i] > PARTICLE_GLOW_BASE + 0.04;
-      const speedGlow = hitActive
-        ? clamp(1.14 + speed * 0.22, 1.14, 1.48)
-        : clamp(0.44 + speed * 0.08, 0.44, 0.62);
-      const whiteMix = hitActive
-        ? clamp(speed * 0.006, 0.0, 0.016)
-        : clamp(0.008 + speed * 0.012, 0.008, 0.032);
+      const inheritedMix = hasAssignedColor ? particleColorMix[i] : 0;
+      const normalSpeedGlow = clamp(0.44 + speed * 0.026, 0.44, 0.52);
+      const flashSpeedGlow = clamp(1.1 + speed * 0.16, 1.1, 1.34);
+      const speedGlow = normalSpeedGlow + (flashSpeedGlow - normalSpeedGlow) * emissionMix;
+      const normalWhiteMix = clamp(0.008 + speed * 0.003, 0.008, 0.016);
+      const flashWhiteMix = clamp(speed * 0.004, 0.0, 0.012);
+      const whiteMix = normalWhiteMix + (flashWhiteMix - normalWhiteMix) * emissionMix;
       const inheritedR = assignedR >= 0 ? assignedR : TEAL.r;
       const inheritedG = assignedG >= 0 ? assignedG : TEAL.g;
       const inheritedB = assignedB >= 0 ? assignedB : TEAL.b;
       const baseR = TEAL.r + (inheritedR - TEAL.r) * inheritedMix;
       const baseG = TEAL.g + (inheritedG - TEAL.g) * inheritedMix;
       const baseB = TEAL.b + (inheritedB - TEAL.b) * inheritedMix;
-      const glowBoost = 1 + Math.max(0, particleAssignedIntensity[i] - PARTICLE_GLOW_BASE);
-      const pulse = 1 + Math.sin(pulseTime * 8 + seed * 9) * (hitActive ? 0.07 : 0.02);
-      particleColors[o] = baseR * speedGlow * glowBoost * pulse + whiteMix;
-      particleColors[o + 1] = baseG * speedGlow * glowBoost * pulse + whiteMix;
-      particleColors[o + 2] = baseB * speedGlow * glowBoost * pulse + whiteMix;
+      const glowBoost = clamp(
+        1 + emissionMix * (PARTICLE_GLOW_BOOST_MAX - 1),
+        1,
+        PARTICLE_GLOW_BOOST_MAX
+      );
+      const pulse = 1 + Math.sin(pulseTime * 8 + seed * 9) * (0.02 + emissionMix * 0.03);
+      particleColors[o] = clamp(baseR * glowTarget * speedGlow * glowBoost * pulse + whiteMix, 0, PARTICLE_COLOR_CHANNEL_MAX);
+      particleColors[o + 1] = clamp(baseG * glowTarget * speedGlow * glowBoost * pulse + whiteMix, 0, PARTICLE_COLOR_CHANNEL_MAX);
+      particleColors[o + 2] = clamp(baseB * glowTarget * speedGlow * glowBoost * pulse + whiteMix, 0, PARTICLE_COLOR_CHANNEL_MAX);
     }
 
     positionAttr.needsUpdate = true;
@@ -1679,23 +1908,44 @@ async function init() {
   buildText(font);
   textReady = true;
   updateViewport();
+  if (gpuFluid) {
+    gpuFluid.dispose();
+  }
+  gpuFluid = createGPUFluidController();
+  clearFluidField();
   animate();
+}
+
+function stopPointerInteraction() {
+  pointer.active = false;
+  pointer.ready = false;
+  pointer.speed = 0;
+  pointer.velocity.set(0, 0, 0);
+  cursorSphere.visible = false;
 }
 
 renderer.domElement.addEventListener("pointermove", (event) => {
   const rect = renderer.domElement.getBoundingClientRect();
+  const screenX = event.clientX - rect.left;
+  const screenY = rect.height - (event.clientY - rect.top);
+
+  if (pointer.active) {
+    queueFluidImpulse([pointer.screen.x, pointer.screen.y], [screenX, screenY]);
+  }
+
+  pointer.screen.set(screenX, screenY);
   pointer.active = true;
   pointer.ndc.set(
-    ((event.clientX - rect.left) / rect.width) * 2 - 1,
+    (screenX / rect.width) * 2 - 1,
     -(((event.clientY - rect.top) / rect.height) * 2 - 1)
   );
   updatePointerProjection(true);
 });
 
-renderer.domElement.addEventListener("pointerleave", () => {
-  pointer.active = false;
-  cursorSphere.visible = false;
-});
+renderer.domElement.addEventListener("pointerleave", stopPointerInteraction);
+renderer.domElement.addEventListener("pointerout", stopPointerInteraction);
+renderer.domElement.addEventListener("pointerup", stopPointerInteraction);
+renderer.domElement.addEventListener("pointercancel", stopPointerInteraction);
 
 let resizeRaf = 0;
 function scheduleViewportUpdate() {

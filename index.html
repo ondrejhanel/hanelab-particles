@@ -194,10 +194,10 @@
         <div class="tuning-row">
           <label for="tuning-particle-count">Particles</label>
           <div class="tuning-value">
-            <input id="tuning-particle-count-number" type="number" min="1600" max="1000000" step="100" value="3000">
+            <input id="tuning-particle-count-number" type="number" min="1600" max="100000" step="100" value="3000">
           </div>
         </div>
-        <input id="tuning-particle-count" type="range" min="1600" max="1000000" step="100" value="3000">
+        <input id="tuning-particle-count" type="range" min="1600" max="100000" step="100" value="3000">
       </div>
       <div class="tuning-group">
         <div class="tuning-row">
@@ -229,6 +229,7 @@
       }
     }
   </script>
+  <script src="./vendor/gpu-io.min.js"></script>
   <script type="module" src="./app.js"></script>
 </body>
 </html>
