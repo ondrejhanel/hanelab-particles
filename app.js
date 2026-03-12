@@ -18,7 +18,7 @@ const BG_COLOR = 0x020707;
 const REFERENCE_AREA = 1440 * 900;
 const BASE_PARTICLES = 3000;
 const MIN_PARTICLES = 1600;
-const MAX_PARTICLES = 100000;
+const MAX_PARTICLES = 1000000;
 const WORDMARK_DISPLAY_SCALE = 0.4;
 const WORDMARK_DEPTH_OFFSET = -18;
 const COUNT_STEP = 100;
@@ -51,12 +51,12 @@ const CORNER_REPEL_FORCE = 0.5;
 const CORNER_REPEL_DAMP = 0.12;
 const CORNER_REPEL_JITTER = 0.4;
 const PARTICLE_HIT_COOLDOWN = 0.22;
-const PARTICLE_HIT_FLASH = 6.4;
-const PARTICLE_HIT_FLASH_EXTRA = 1.8;
+const PARTICLE_HIT_FLASH = 64;
+const PARTICLE_HIT_FLASH_EXTRA = 18;
 const PARTICLE_GLOW_BASE = 0.62;
 const PARTICLE_GLOW_WAKE = 0.34;
 const PARTICLE_GLOW_SPEED = 0.016;
-const PARTICLE_GLOW_DECAY = 0.12;
+const PARTICLE_HIT_FADE_TIME = 5;
 
 const container = document.getElementById("app");
 if (!container) throw new Error("Missing #app container");
@@ -1211,7 +1211,6 @@ function stepFluidField(frame) {
   const swirlStrength = 0.11;
   const pressureIterations = 8;
   const projectionStrength = 0.92;
-
   for (let y = 0; y < FLUID_ROWS; y++) {
     const upY = Math.max(y - 1, 0);
     const downY = Math.min(y + 1, FLUID_ROWS - 1);
@@ -1545,11 +1544,11 @@ function animate() {
 
           if (particleAssignedLetter[i] < 0) {
             const randomLetterIndex = Math.floor(Math.random() * letterEntries.length);
+            const hitColor = letterEntries[randomLetterIndex].glow.material.color;
             particleAssignedLetter[i] = randomLetterIndex;
-            tmpV4.copy(letterEntries[randomLetterIndex].glow.material.color);
-            particleAssignedColors[o] = tmpV4.x;
-            particleAssignedColors[o + 1] = tmpV4.y;
-            particleAssignedColors[o + 2] = tmpV4.z;
+            particleAssignedColors[o] = hitColor.r;
+            particleAssignedColors[o + 1] = hitColor.g;
+            particleAssignedColors[o + 2] = hitColor.b;
           }
 
           if (particleHitCooldown[i] <= 0) {
@@ -1581,6 +1580,8 @@ function animate() {
       }
 
       particleWake[i] *= 0.956;
+      const hitFadeAlpha = 1 - Math.exp(-dt / PARTICLE_HIT_FADE_TIME);
+      particleColorMix[i] += (0 - particleColorMix[i]) * hitFadeAlpha;
       let speed = Math.sqrt(vx * vx + vy * vy + vz * vz);
       const planarSpeed = Math.sqrt(vx * vx + vy * vy);
       const eddy = particleWake[i] * clamp(planarSpeed * 0.016 * turbulence, 0, 0.085) * frame;
@@ -1622,35 +1623,41 @@ function animate() {
       const assignedR = particleAssignedColors[o];
       const assignedG = particleAssignedColors[o + 1];
       const assignedB = particleAssignedColors[o + 2];
-      const assignedLetter = particleAssignedLetter[i];
-      const assigned = assignedLetter >= 0;
-      const speedGlow = assigned
-        ? clamp(1.04 + speed * 0.18, 1.04, 1.28)
-        : clamp(0.44 + speed * 0.08, 0.44, 0.62);
-      const whiteMix = assigned
-        ? clamp(speed * 0.005, 0.0, 0.012)
-        : clamp(0.008 + speed * 0.012, 0.008, 0.032);
-      const sourceColor = assigned ? letterPalette[assignedLetter] : null;
-      const baseR = assigned ? sourceColor.r : (assignedR >= 0 ? assignedR : TEAL.r);
-      const baseG = assigned ? sourceColor.g : (assignedG >= 0 ? assignedG : TEAL.g);
-      const baseB = assigned ? sourceColor.b : (assignedB >= 0 ? assignedB : TEAL.b);
-      if (assigned) {
-        const glowTarget = PARTICLE_GLOW_BASE +
-          particleWake[i] * PARTICLE_GLOW_WAKE +
-          clamp(speed * PARTICLE_GLOW_SPEED, 0, 0.38);
-        particleAssignedIntensity[i] += (glowTarget - particleAssignedIntensity[i]) *
-          clamp(PARTICLE_GLOW_DECAY * frame, 0.04, 0.22);
-        const intensity = particleAssignedIntensity[i];
-        const pulse = 1 + Math.sin(pulseTime * 8 + seed * 9) * 0.04;
-        particleColors[o] = baseR * intensity * speedGlow * pulse + whiteMix;
-        particleColors[o + 1] = baseG * intensity * speedGlow * pulse + whiteMix;
-        particleColors[o + 2] = baseB * intensity * speedGlow * pulse + whiteMix;
-      } else {
-        particleAssignedIntensity[i] = PARTICLE_GLOW_BASE;
-        particleColors[o] = baseR * speedGlow * (1 - whiteMix) + whiteMix;
-        particleColors[o + 1] = baseG * speedGlow * (1 - whiteMix) + whiteMix;
-        particleColors[o + 2] = baseB * speedGlow * (1 - whiteMix) + whiteMix;
+      const glowTarget = PARTICLE_GLOW_BASE +
+        particleWake[i] * PARTICLE_GLOW_WAKE +
+        clamp(speed * PARTICLE_GLOW_SPEED, 0, 0.38);
+      particleAssignedIntensity[i] += (glowTarget - particleAssignedIntensity[i]) * hitFadeAlpha;
+
+      if (
+        particleAssignedLetter[i] >= 0 &&
+        particleColorMix[i] < 0.004 &&
+        particleAssignedIntensity[i] <= glowTarget + 0.04
+      ) {
+        particleAssignedLetter[i] = -1;
+        particleAssignedColors[o] = -1;
+        particleAssignedColors[o + 1] = -1;
+        particleAssignedColors[o + 2] = -1;
       }
+
+      const inheritedMix = particleAssignedLetter[i] >= 0 ? particleColorMix[i] : 0;
+      const hitActive = inheritedMix > 0.001 || particleAssignedIntensity[i] > PARTICLE_GLOW_BASE + 0.04;
+      const speedGlow = hitActive
+        ? clamp(1.14 + speed * 0.22, 1.14, 1.48)
+        : clamp(0.44 + speed * 0.08, 0.44, 0.62);
+      const whiteMix = hitActive
+        ? clamp(speed * 0.006, 0.0, 0.016)
+        : clamp(0.008 + speed * 0.012, 0.008, 0.032);
+      const inheritedR = assignedR >= 0 ? assignedR : TEAL.r;
+      const inheritedG = assignedG >= 0 ? assignedG : TEAL.g;
+      const inheritedB = assignedB >= 0 ? assignedB : TEAL.b;
+      const baseR = TEAL.r + (inheritedR - TEAL.r) * inheritedMix;
+      const baseG = TEAL.g + (inheritedG - TEAL.g) * inheritedMix;
+      const baseB = TEAL.b + (inheritedB - TEAL.b) * inheritedMix;
+      const glowBoost = 1 + Math.max(0, particleAssignedIntensity[i] - PARTICLE_GLOW_BASE);
+      const pulse = 1 + Math.sin(pulseTime * 8 + seed * 9) * (hitActive ? 0.07 : 0.02);
+      particleColors[o] = baseR * speedGlow * glowBoost * pulse + whiteMix;
+      particleColors[o + 1] = baseG * speedGlow * glowBoost * pulse + whiteMix;
+      particleColors[o + 2] = baseB * speedGlow * glowBoost * pulse + whiteMix;
     }
 
     positionAttr.needsUpdate = true;
