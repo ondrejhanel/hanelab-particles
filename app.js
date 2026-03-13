@@ -31,7 +31,7 @@ const BG_COLOR = 0x020707;
 const REFERENCE_AREA = 1440 * 900;
 const BASE_PARTICLES = 3000;
 const MIN_PARTICLES = 1600;
-const MAX_PARTICLES = 1000000;
+const MAX_PARTICLES = 5000000;
 const WORDMARK_DISPLAY_SCALE = 0.4;
 const WORDMARK_DEPTH_OFFSET = -18;
 const COUNT_STEP = 100;
@@ -51,6 +51,10 @@ const PARTICLE_COUNT_MIN = MIN_PARTICLES;
 const PARTICLE_COUNT_MAX = MAX_PARTICLES;
 const PARTICLE_SIZE_MIN = 1;
 const PARTICLE_SIZE_MAX = 24;
+const PARTICLE_OPACITY_MIN = 0;
+const PARTICLE_OPACITY_MAX = 1;
+const PARTICLE_OPACITY_RANDOMNESS_MIN = 0;
+const PARTICLE_OPACITY_RANDOMNESS_MAX = 1;
 const PARTICLE_SIZE_RANDOMNESS_MIN = 0;
 const PARTICLE_SIZE_RANDOMNESS_MAX = 1;
 const ACTIVITY_GAIN_MIN = 0.2;
@@ -100,10 +104,23 @@ const FLUID_JACOBI_STEPS = 4;
 const FLUID_MAX_VELOCITY = 36;
 const FLUID_SAMPLE_SCALE = 0.22;
 const FLUID_MIN_IMPULSE_PX = 12;
+const DEFAULT_MOTION_TUNING = Object.freeze({
+  friction: 0.3504,
+  viscosity: 0.35,
+  radius: 0.25,
+  showCursor: false,
+  activityGain: 1.0,
+  particleCount: 500800,
+  particleSize: 5.0,
+  particleOpacity: 1.0,
+  particleOpacityRandomness: 0.5,
+  particleSizeRandomness: 0.5
+});
 
 const container = document.getElementById("app");
 if (!container) throw new Error("Missing #app container");
 const tuningPanel = document.getElementById("tuning-panel");
+const tuningResetButton = document.getElementById("tuning-reset");
 const frictionInput = document.getElementById("tuning-friction");
 const frictionNumberInput = document.getElementById("tuning-friction-number");
 const viscosityInput = document.getElementById("tuning-viscosity");
@@ -117,6 +134,10 @@ const particleCountInput = document.getElementById("tuning-particle-count");
 const particleCountNumberInput = document.getElementById("tuning-particle-count-number");
 const particleSizeInput = document.getElementById("tuning-particle-size");
 const particleSizeNumberInput = document.getElementById("tuning-particle-size-number");
+const particleOpacityInput = document.getElementById("tuning-particle-opacity");
+const particleOpacityNumberInput = document.getElementById("tuning-particle-opacity-number");
+const particleOpacityRandomnessInput = document.getElementById("tuning-particle-opacity-randomness");
+const particleOpacityRandomnessNumberInput = document.getElementById("tuning-particle-opacity-randomness-number");
 const particleSizeRandomnessInput = document.getElementById("tuning-particle-size-randomness");
 const particleSizeRandomnessNumberInput = document.getElementById("tuning-particle-size-randomness-number");
 const motionTuning = loadMotionTuning();
@@ -185,6 +206,7 @@ let particleMaterial = null;
 let gpuParticleController = null;
 let particleCount = 0;
 let particleTargetCount = 0;
+let particleResizeTimeout = 0;
 let particlePositions = new Float32Array(0);
 let particleVelocities = new Float32Array(0);
 let particleSeeds = new Float32Array(0);
@@ -610,6 +632,10 @@ function normalizeParticleSize(value) {
   return clamp(value, PARTICLE_SIZE_MIN, PARTICLE_SIZE_MAX);
 }
 
+function normalizeParticleOpacity(value) {
+  return clamp(value, PARTICLE_OPACITY_MIN, PARTICLE_OPACITY_MAX);
+}
+
 function normalizeActivityGain(value) {
   return clamp(value, ACTIVITY_GAIN_MIN, ACTIVITY_GAIN_MAX);
 }
@@ -620,6 +646,10 @@ function normalizeViscosity(value) {
 
 function normalizeParticleSizeRandomness(value) {
   return clamp(value, PARTICLE_SIZE_RANDOMNESS_MIN, PARTICLE_SIZE_RANDOMNESS_MAX);
+}
+
+function normalizeParticleOpacityRandomness(value) {
+  return clamp(value, PARTICLE_OPACITY_RANDOMNESS_MIN, PARTICLE_OPACITY_RANDOMNESS_MAX);
 }
 
 function getLegacyBaseParticleSize() {
@@ -649,6 +679,8 @@ function updateParticleMaterialTuning() {
   );
   sizeUniforms.uParticleSizeScale.value = motionTuning.particleSize;
   sizeUniforms.uParticleSizeRandomness.value = motionTuning.particleSizeRandomness;
+  sizeUniforms.uParticleOpacity.value = motionTuning.particleOpacity;
+  sizeUniforms.uParticleOpacityRandomness.value = motionTuning.particleOpacityRandomness;
   sizeUniforms.uViewportScale.value = renderer.domElement.height * 0.5;
   sizeUniforms.uParticleDensitySize.value = visualDensity.size;
   sizeUniforms.uParticleDensityAlpha.value = visualDensity.alpha;
@@ -694,19 +726,10 @@ function getParticleVisualDensity(count, particleSize) {
 }
 
 function loadMotionTuning() {
-  const defaults = {
-    friction: 0.5,
-    viscosity: 0.5,
-    radius: 0.2,
-    showCursor: true,
-    activityGain: 1.9,
-    particleCount: null,
-    particleSize: 9.8,
-    particleSizeRandomness: 0.35
-  };
+  const defaults = DEFAULT_MOTION_TUNING;
   try {
     const raw = window.localStorage.getItem(TUNING_STORAGE_KEY);
-    if (!raw) return defaults;
+    if (!raw) return { ...defaults };
     const parsed = JSON.parse(raw);
     const parsedFriction = Number(parsed.friction);
     const parsedViscosity = Number(parsed.viscosity);
@@ -715,6 +738,8 @@ function loadMotionTuning() {
     const parsedActivityGain = Number(parsed.activityGain);
     const parsedParticleCount = parsed.particleCount == null ? null : Number(parsed.particleCount);
     const parsedParticleSize = Number(parsed.particleSize);
+    const parsedParticleOpacity = Number(parsed.particleOpacity);
+    const parsedParticleOpacityRandomness = Number(parsed.particleOpacityRandomness);
     const parsedParticleSizeRandomness = Number(parsed.particleSizeRandomness);
     const normalizedRadius = Number.isFinite(parsedRadius)
       ? parsedRadius > 1
@@ -747,12 +772,18 @@ function loadMotionTuning() {
             : parsedParticleSize
         )
         : defaults.particleSize,
+      particleOpacity: Number.isFinite(parsedParticleOpacity)
+        ? normalizeParticleOpacity(parsedParticleOpacity)
+        : defaults.particleOpacity,
+      particleOpacityRandomness: Number.isFinite(parsedParticleOpacityRandomness)
+        ? normalizeParticleOpacityRandomness(parsedParticleOpacityRandomness)
+        : defaults.particleOpacityRandomness,
       particleSizeRandomness: Number.isFinite(parsedParticleSizeRandomness)
         ? normalizeParticleSizeRandomness(parsedParticleSizeRandomness)
         : defaults.particleSizeRandomness
     };
   } catch {
-    return defaults;
+    return { ...defaults };
   }
 }
 
@@ -762,6 +793,24 @@ function saveMotionTuning() {
   } catch {
     // Ignore storage failures; runtime tuning still works for the session.
   }
+}
+
+function scheduleParticleResize(delayMs = 0) {
+  if (particleResizeTimeout) {
+    window.clearTimeout(particleResizeTimeout);
+    particleResizeTimeout = 0;
+  }
+  const runResize = () => {
+    particleResizeTimeout = 0;
+    if (!textReady || !particleTargetCount || particleTargetCount === particleCount) return;
+    resizeParticleSystem(particleTargetCount);
+    syncTuningPanel();
+  };
+  if (delayMs <= 0) {
+    runResize();
+    return;
+  }
+  particleResizeTimeout = window.setTimeout(runResize, delayMs);
 }
 
 function syncTuningPanel() {
@@ -779,6 +828,16 @@ function syncTuningPanel() {
   if (particleCountNumberInput) particleCountNumberInput.value = String(displayParticleCount);
   if (particleSizeInput) particleSizeInput.value = motionTuning.particleSize.toFixed(1);
   if (particleSizeNumberInput) particleSizeNumberInput.value = motionTuning.particleSize.toFixed(1);
+  if (particleOpacityInput) particleOpacityInput.value = motionTuning.particleOpacity.toFixed(2);
+  if (particleOpacityNumberInput) {
+    particleOpacityNumberInput.value = (motionTuning.particleOpacity * 100).toFixed(0);
+  }
+  if (particleOpacityRandomnessInput) {
+    particleOpacityRandomnessInput.value = motionTuning.particleOpacityRandomness.toFixed(2);
+  }
+  if (particleOpacityRandomnessNumberInput) {
+    particleOpacityRandomnessNumberInput.value = (motionTuning.particleOpacityRandomness * 100).toFixed(0);
+  }
   if (particleSizeRandomnessInput) {
     particleSizeRandomnessInput.value = motionTuning.particleSizeRandomness.toFixed(2);
   }
@@ -829,11 +888,28 @@ function setupTuningPanel() {
     particleTargetCount = motionTuning.particleCount;
     syncTuningPanel();
     saveMotionTuning();
+    scheduleParticleResize(50);
   };
 
   const applyParticleSize = (value) => {
     if (!Number.isFinite(value)) return;
     motionTuning.particleSize = normalizeParticleSize(value);
+    syncTuningPanel();
+    updateParticleMaterialTuning();
+    saveMotionTuning();
+  };
+
+  const applyParticleOpacity = (value) => {
+    if (!Number.isFinite(value)) return;
+    motionTuning.particleOpacity = normalizeParticleOpacity(value);
+    syncTuningPanel();
+    updateParticleMaterialTuning();
+    saveMotionTuning();
+  };
+
+  const applyParticleOpacityRandomness = (value) => {
+    if (!Number.isFinite(value)) return;
+    motionTuning.particleOpacityRandomness = normalizeParticleOpacityRandomness(value);
     syncTuningPanel();
     updateParticleMaterialTuning();
     saveMotionTuning();
@@ -845,6 +921,16 @@ function setupTuningPanel() {
     syncTuningPanel();
     updateParticleMaterialTuning();
     saveMotionTuning();
+  };
+
+  const applyDefaults = () => {
+    Object.assign(motionTuning, DEFAULT_MOTION_TUNING);
+    particleTargetCount = motionTuning.particleCount;
+    syncTuningPanel();
+    updateParticleMaterialTuning();
+    saveMotionTuning();
+    stopPointerInteraction();
+    scheduleParticleResize(0);
   };
 
   syncTuningPanel();
@@ -925,6 +1011,30 @@ function setupTuningPanel() {
     applyParticleSize(Number(particleSizeNumberInput.value));
   });
 
+  particleOpacityInput?.addEventListener("input", () => {
+    applyParticleOpacity(Number(particleOpacityInput.value));
+  });
+
+  particleOpacityNumberInput?.addEventListener("input", () => {
+    applyParticleOpacity(Number(particleOpacityNumberInput.value) / 100);
+  });
+
+  particleOpacityNumberInput?.addEventListener("change", () => {
+    applyParticleOpacity(Number(particleOpacityNumberInput.value) / 100);
+  });
+
+  particleOpacityRandomnessInput?.addEventListener("input", () => {
+    applyParticleOpacityRandomness(Number(particleOpacityRandomnessInput.value));
+  });
+
+  particleOpacityRandomnessNumberInput?.addEventListener("input", () => {
+    applyParticleOpacityRandomness(Number(particleOpacityRandomnessNumberInput.value) / 100);
+  });
+
+  particleOpacityRandomnessNumberInput?.addEventListener("change", () => {
+    applyParticleOpacityRandomness(Number(particleOpacityRandomnessNumberInput.value) / 100);
+  });
+
   particleSizeRandomnessInput?.addEventListener("input", () => {
     applyParticleSizeRandomness(Number(particleSizeRandomnessInput.value));
   });
@@ -935,6 +1045,10 @@ function setupTuningPanel() {
 
   particleSizeRandomnessNumberInput?.addEventListener("change", () => {
     applyParticleSizeRandomness(Number(particleSizeRandomnessNumberInput.value) / 100);
+  });
+
+  tuningResetButton?.addEventListener("click", () => {
+    applyDefaults();
   });
 }
 
@@ -1814,6 +1928,8 @@ function ensureParticleMaterial() {
       uParticleMap: { value: particleSprite },
       uParticleSizeScale: { value: motionTuning.particleSize },
       uParticleSizeRandomness: { value: motionTuning.particleSizeRandomness },
+      uParticleOpacity: { value: motionTuning.particleOpacity },
+      uParticleOpacityRandomness: { value: motionTuning.particleOpacityRandomness },
       uParticlePulseTime: { value: pulseTime },
       uViewportScale: { value: 1 },
       uParticleDensitySize: { value: 1 },
@@ -1840,6 +1956,7 @@ function ensureParticleMaterial() {
       attribute float aSizeVariance;
 
       varying vec3 vParticleColor;
+      varying float vOpacitySeed;
 
       ${makeLetterColorLookupGLSL("uLetterColors")}
 
@@ -1887,6 +2004,7 @@ function ensureParticleMaterial() {
         float glowCeiling = max(${PARTICLE_COLOR_CHANNEL_MAX.toFixed(6)} - whiteMix, 0.0);
         float huePreservingEnergy = min(glowEnergy, glowCeiling / basePeak);
         vParticleColor = clamp(baseColor * huePreservingEnergy + whiteMix, 0.0, ${PARTICLE_COLOR_CHANNEL_MAX.toFixed(6)});
+        vOpacitySeed = fract(baseData.x * 17.173 + baseData.y * 5.731 + baseData.z * 3.947);
 
         vec4 mvPosition = modelViewMatrix * vec4(positionData.xyz, 1.0);
         gl_Position = projectionMatrix * mvPosition;
@@ -1900,7 +2018,10 @@ function ensureParticleMaterial() {
     fragmentShader: `
       uniform sampler2D uParticleMap;
       uniform float uParticleDensityAlpha;
+      uniform float uParticleOpacity;
+      uniform float uParticleOpacityRandomness;
       varying vec3 vParticleColor;
+      varying float vOpacitySeed;
 
       void main() {
         vec2 spriteUv = gl_PointCoord * 2.0 - 1.0;
@@ -1909,9 +2030,12 @@ function ensureParticleMaterial() {
 
         vec4 sprite = texture2D(uParticleMap, gl_PointCoord);
         float radialMask = 1.0 - smoothstep(0.76, 1.0, spriteRadius);
+        float opacityRandom = mix(1.0, mix(0.12, 1.0, vOpacitySeed), uParticleOpacityRandomness);
+        float opacityControl = clamp(uParticleOpacity, 0.0, 1.0);
+        float densityAdjustedAlpha = mix(uParticleDensityAlpha, 1.0, opacityControl);
         vec4 color = vec4(vParticleColor, 1.0);
         color.rgb *= sprite.rgb * radialMask;
-        color.a = sprite.a * radialMask * uParticleDensityAlpha;
+        color.a = sprite.a * radialMask * densityAdjustedAlpha * opacityControl * opacityRandom;
         if (color.a < 0.035) discard;
         gl_FragColor = color;
       }
@@ -1920,6 +2044,8 @@ function ensureParticleMaterial() {
   particleMaterial.userData.sizeUniforms = {
     uParticleSizeScale: particleMaterial.uniforms.uParticleSizeScale,
     uParticleSizeRandomness: particleMaterial.uniforms.uParticleSizeRandomness,
+    uParticleOpacity: particleMaterial.uniforms.uParticleOpacity,
+    uParticleOpacityRandomness: particleMaterial.uniforms.uParticleOpacityRandomness,
     uParticlePulseTime: particleMaterial.uniforms.uParticlePulseTime,
     uViewportScale: particleMaterial.uniforms.uViewportScale,
     uParticleDensitySize: particleMaterial.uniforms.uParticleDensitySize,
@@ -2129,6 +2255,15 @@ function getFluidCanvasMetrics() {
     width: Math.max(1, rect.width || renderer.domElement.clientWidth || 1),
     height: Math.max(1, rect.height || renderer.domElement.clientHeight || 1)
   };
+}
+
+function mapLocalPointToFluidScreen(localX, localY, target) {
+  const { width, height } = getFluidCanvasMetrics();
+  target.set(
+    ((clamp(localX, -viewportBounds.x, viewportBounds.x) + viewportBounds.x) / Math.max(viewportBounds.x * 2, 1)) * width,
+    ((clamp(localY, -viewportBounds.y, viewportBounds.y) + viewportBounds.y) / Math.max(viewportBounds.y * 2, 1)) * height
+  );
+  return target;
 }
 
 function getFluidImpulseThickness() {
@@ -2479,8 +2614,11 @@ function updateFluidSimulationSize() {
 function updatePointerProjection(updateMotion) {
   if (!pointer.active && !pointer.ready) return;
 
-  raycaster.setFromCamera(pointer.ndc, camera);
   logoRig.updateMatrixWorld(true);
+  tmpV3.set(0, 0, 1).transformDirection(logoRig.matrixWorld).normalize();
+  tmpV4.set(0, 0, 0).applyMatrix4(logoRig.matrixWorld);
+  pointerPlane.setFromNormalAndCoplanarPoint(tmpV3, tmpV4);
+  raycaster.setFromCamera(pointer.ndc, camera);
   inverseLogoMatrix.copy(logoRig.matrixWorld).invert();
 
   pointer.rayOriginLocal.copy(raycaster.ray.origin).applyMatrix4(inverseLogoMatrix);
@@ -2488,6 +2626,7 @@ function updatePointerProjection(updateMotion) {
 
   if (!raycaster.ray.intersectPlane(pointerPlane, pointerWorldHit)) return;
   tmpV1.copy(pointerWorldHit).applyMatrix4(inverseLogoMatrix);
+  tmpV1.z = 0;
 
   if (updateMotion) {
     if (pointer.ready) {
@@ -2567,6 +2706,7 @@ function updateViewport() {
       syncTuningPanel();
     } else if (desiredCount !== particleTargetCount) {
       particleTargetCount = desiredCount;
+      scheduleParticleResize(0);
       syncTuningPanel();
     }
   }
@@ -2592,16 +2732,6 @@ function animate() {
   const frame = dt * 60;
   const t = clock.elapsedTime;
   pulseTime += dt;
-
-  if (pointer.active) {
-    updatePointerProjection(false);
-  }
-
-  if (textReady && particleTargetCount > 0 && particleTargetCount !== particleCount) {
-    const delta = particleTargetCount - particleCount;
-    const step = Math.sign(delta) * Math.min(Math.abs(delta), COUNT_STEP * 2);
-    resizeParticleSystem(particleCount + step);
-  }
 
   pointer.ndcSmooth.lerp(pointer.ndc, pointer.active ? 0.12 : 0.08);
   pointer.velocity.multiplyScalar(pointer.active ? 0.84 : 0.78);
@@ -2630,13 +2760,13 @@ function animate() {
   const hitRadiusSq = hitRadius * hitRadius;
   const pointerLocalX = clamp(
     pointer.local.x,
-    -Math.max(viewportBounds.x - hitRadius, 0),
-    Math.max(viewportBounds.x - hitRadius, 0)
+    -Math.max(boundX - hitRadius, 0),
+    Math.max(boundX - hitRadius, 0)
   );
   const pointerLocalY = clamp(
     pointer.local.y,
-    -Math.max(viewportBounds.y - hitRadius, 0),
-    Math.max(viewportBounds.y - hitRadius, 0)
+    -Math.max(boundY - hitRadius, 0),
+    Math.max(boundY - hitRadius, 0)
   );
   const pointerLocalZ = clamp(
     pointer.local.z,
@@ -2679,6 +2809,10 @@ function animate() {
   logoRig.position.y += (Math.sin(t * 0.48) * 5 - logoRig.position.y) * 0.035;
   backgroundHalo.material.rotation += 0.00035;
 
+  if (pointer.active) {
+    updatePointerProjection(false);
+  }
+
   if (cursorSphere.visible) {
     logoRig.updateMatrixWorld(true);
     tmpCursorWorld.set(pointerLocalX, pointerLocalY, pointerLocalZ).applyMatrix4(logoRig.matrixWorld);
@@ -2710,28 +2844,41 @@ function stopPointerInteraction() {
   cursorSphere.visible = false;
 }
 
-renderer.domElement.addEventListener("pointermove", (event) => {
+function handlePointerMove(event) {
+  if (!(event.target instanceof Element)) return;
   const rect = renderer.domElement.getBoundingClientRect();
-  const screenX = event.clientX - rect.left;
-  const screenY = rect.height - (event.clientY - rect.top);
-
-  if (pointer.active) {
-    queueFluidImpulse([pointer.screen.x, pointer.screen.y], [screenX, screenY]);
+  const localX = event.clientX - rect.left;
+  const localY = event.clientY - rect.top;
+  const insideCanvas = localX >= 0 && localX <= rect.width && localY >= 0 && localY <= rect.height;
+  if (!insideCanvas) {
+    stopPointerInteraction();
+    return;
   }
 
-  pointer.screen.set(screenX, screenY);
+  if (tuningPanel?.contains(event.target) && event.buttons !== 0) {
+    stopPointerInteraction();
+    return;
+  }
+
+  const hadPointer = pointer.active && pointer.ready;
   pointer.active = true;
   pointer.ndc.set(
-    (screenX / Math.max(rect.width, 1)) * 2 - 1,
-    -((((event.clientY - rect.top) / Math.max(rect.height, 1)) * 2) - 1)
+    (localX / Math.max(rect.width, 1)) * 2 - 1,
+    -(((localY / Math.max(rect.height, 1)) * 2) - 1)
   );
   updatePointerProjection(true);
-});
 
-renderer.domElement.addEventListener("pointerleave", stopPointerInteraction);
-renderer.domElement.addEventListener("pointerout", stopPointerInteraction);
-renderer.domElement.addEventListener("pointerup", stopPointerInteraction);
-renderer.domElement.addEventListener("pointercancel", stopPointerInteraction);
+  mapLocalPointToFluidScreen(pointer.local.x, pointer.local.y, tmpFlowC);
+  if (hadPointer) {
+    queueFluidImpulse([pointer.screen.x, pointer.screen.y], [tmpFlowC.x, tmpFlowC.y]);
+  }
+  pointer.screen.copy(tmpFlowC);
+}
+
+window.addEventListener("pointermove", handlePointerMove, { passive: true });
+window.addEventListener("pointerup", stopPointerInteraction);
+window.addEventListener("pointercancel", stopPointerInteraction);
+window.addEventListener("blur", stopPointerInteraction);
 
 let resizeRaf = 0;
 function scheduleViewportUpdate() {
