@@ -156,6 +156,14 @@
       cursor: ew-resize;
     }
 
+    .tuning-value input[type="checkbox"] {
+      width: 14px;
+      height: 14px;
+      margin: 0;
+      accent-color: rgb(41, 227, 198);
+      cursor: pointer;
+    }
+
     @media (max-width: 768px) {
       .tuning-panel {
         top: 12px;
@@ -174,11 +182,21 @@
         <div class="tuning-row">
           <label for="tuning-friction">Friction</label>
           <div class="tuning-value">
-            <input id="tuning-friction-number" type="number" min="0.1" max="100" step="0.1" value="50">
+            <input id="tuning-friction-number" type="number" min="0.01" max="100" step="0.01" value="50">
             <span>%</span>
           </div>
         </div>
-        <input id="tuning-friction" type="range" min="0.001" max="1" step="0.001" value="0.5">
+        <input id="tuning-friction" type="range" min="0.0001" max="1" step="0.0001" value="0.5">
+      </div>
+      <div class="tuning-group">
+        <div class="tuning-row">
+          <label for="tuning-viscosity">Viscosity</label>
+          <div class="tuning-value">
+            <input id="tuning-viscosity-number" type="number" min="0" max="100" step="1" value="50">
+            <span>%</span>
+          </div>
+        </div>
+        <input id="tuning-viscosity" type="range" min="0" max="1" step="0.001" value="0.5">
       </div>
       <div class="tuning-group">
         <div class="tuning-row">
@@ -192,22 +210,31 @@
       </div>
       <div class="tuning-group">
         <div class="tuning-row">
-          <label for="tuning-particle-count">Particles</label>
+          <label for="tuning-activity-gain">Activity Gain</label>
           <div class="tuning-value">
-            <input id="tuning-particle-count-number" type="number" min="1600" max="100000" step="100" value="3000">
+            <input id="tuning-activity-gain-number" type="number" min="20" max="400" step="1" value="190">
+            <span>%</span>
           </div>
         </div>
-        <input id="tuning-particle-count" type="range" min="1600" max="100000" step="100" value="3000">
+        <input id="tuning-activity-gain" type="range" min="0.2" max="4" step="0.01" value="1.9">
+      </div>
+      <div class="tuning-group">
+        <div class="tuning-row">
+          <label for="tuning-particle-count">Particles</label>
+          <div class="tuning-value">
+            <input id="tuning-particle-count-number" type="number" min="1600" max="1000000" step="100" value="3000">
+          </div>
+        </div>
+        <input id="tuning-particle-count" type="range" min="1600" max="1000000" step="100" value="3000">
       </div>
       <div class="tuning-group">
         <div class="tuning-row">
           <label for="tuning-particle-size">Particle Size</label>
           <div class="tuning-value">
-            <input id="tuning-particle-size-number" type="number" min="50" max="250" step="1" value="100">
-            <span>%</span>
+            <input id="tuning-particle-size-number" type="number" min="1" max="24" step="0.1" value="9.8">
           </div>
         </div>
-        <input id="tuning-particle-size" type="range" min="0.5" max="2.5" step="0.01" value="1">
+        <input id="tuning-particle-size" type="range" min="1" max="24" step="0.1" value="9.8">
       </div>
       <div class="tuning-group">
         <div class="tuning-row">
@@ -218,6 +245,14 @@
           </div>
         </div>
         <input id="tuning-particle-size-randomness" type="range" min="0" max="1" step="0.01" value="0.35">
+      </div>
+      <div class="tuning-group">
+        <div class="tuning-row">
+          <label for="tuning-show-cursor">Show Cursor</label>
+          <div class="tuning-value">
+            <input id="tuning-show-cursor" type="checkbox" checked>
+          </div>
+        </div>
       </div>
     </div>
   </div>

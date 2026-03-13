@@ -2,7 +2,7 @@ import * as THREE from "three";
 import { FontLoader } from "three/addons/loaders/FontLoader.js";
 import { TTFLoader } from "three/addons/loaders/TTFLoader.js";
 import { TextGeometry } from "three/addons/geometries/TextGeometry.js";
-import { MeshSurfaceSampler } from "three/addons/math/MeshSurfaceSampler.js";
+import { GPUComputationRenderer } from "three/addons/misc/GPUComputationRenderer.js";
 import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
 import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
 import { UnrealBloomPass } from "three/addons/postprocessing/UnrealBloomPass.js";
@@ -31,7 +31,7 @@ const BG_COLOR = 0x020707;
 const REFERENCE_AREA = 1440 * 900;
 const BASE_PARTICLES = 3000;
 const MIN_PARTICLES = 1600;
-const MAX_PARTICLES = 100000;
+const MAX_PARTICLES = 1000000;
 const WORDMARK_DISPLAY_SCALE = 0.4;
 const WORDMARK_DEPTH_OFFSET = -18;
 const COUNT_STEP = 100;
@@ -39,18 +39,22 @@ const FLUID_COLS = 72;
 const FLUID_ROWS = 40;
 const FLUID_CELL_COUNT = FLUID_COLS * FLUID_ROWS;
 const TUNING_STORAGE_KEY = "hanelab-motion-tuning";
-const FRICTION_MIN = 0.001;
+const FRICTION_MIN = 0.0001;
 const FRICTION_MAX = 1;
+const VISCOSITY_MIN = 0;
+const VISCOSITY_MAX = 1;
 const LEGACY_RADIUS_MIN = 1.31;
 const LEGACY_RADIUS_MAX = 3;
 const RADIUS_MIN = 0.01;
 const RADIUS_MAX = 1;
 const PARTICLE_COUNT_MIN = MIN_PARTICLES;
 const PARTICLE_COUNT_MAX = MAX_PARTICLES;
-const PARTICLE_SIZE_MIN = 0.5;
-const PARTICLE_SIZE_MAX = 2.5;
+const PARTICLE_SIZE_MIN = 1;
+const PARTICLE_SIZE_MAX = 24;
 const PARTICLE_SIZE_RANDOMNESS_MIN = 0;
 const PARTICLE_SIZE_RANDOMNESS_MAX = 1;
+const ACTIVITY_GAIN_MIN = 0.2;
+const ACTIVITY_GAIN_MAX = 4;
 const CURSOR_SPHERE_COLOR = 0x7afcf2;
 const TEXT_COLLIDER_MARGIN = 10;
 const TEXT_COLLIDER_FORCE = 0.24;
@@ -59,10 +63,16 @@ const EDGE_REPEL_START = 0.78;
 const EDGE_REPEL_FORCE = 0.34;
 const EDGE_REPEL_DAMP = 0.08;
 const EDGE_REPEL_JITTER = 0.32;
-const CORNER_REPEL_START = 0.7;
-const CORNER_REPEL_FORCE = 0.5;
-const CORNER_REPEL_DAMP = 0.12;
-const CORNER_REPEL_JITTER = 0.4;
+const OUTER_SHELL_SCALE_XY = 1.2;
+const OUTER_SHELL_SCALE_Z = 0.1;
+const PARTICLE_HARD_BOUND_SCALE_XY = 1.45;
+const PARTICLE_HARD_BOUND_SCALE_Z = 1.65;
+const CURSOR_BOX_SCALE_X = 1.1;
+const CURSOR_BOX_SCALE_Y = 0.82;
+const CURSOR_BOX_SCALE_Z = 0.34;
+const CURSOR_BOX_ROUNDNESS = 0.82;
+const CURSOR_BOX_FIELD_MARGIN = 0.26;
+const CURSOR_BOX_FIELD_FORCE = 0.048;
 const PARTICLE_HIT_COOLDOWN = 0.22;
 const PARTICLE_HIT_FLASH = 4.8;
 const PARTICLE_HIT_FLASH_EXTRA = 1.6;
@@ -70,10 +80,17 @@ const PARTICLE_GLOW_BASE = 0.62;
 const PARTICLE_GLOW_WAKE = 0.34;
 const PARTICLE_GLOW_SPEED = 0.016;
 const PARTICLE_HIT_FADE_TIME = 1.7;
-const PARTICLE_COLOR_FADE_TIME = 3.8;
-const PARTICLE_INTENSITY_MAX = 4.6;
-const PARTICLE_GLOW_BOOST_MAX = 3.4;
-const PARTICLE_COLOR_CHANNEL_MAX = 1.14;
+const PARTICLE_COLOR_FADE_TIME = 3.0;
+const PARTICLE_ACTIVITY_RISE_TIME = 0.28;
+const PARTICLE_INTENSITY_MAX = 5.8;
+const PARTICLE_GLOW_BOOST_MAX = 8.4;
+const PARTICLE_COLOR_CHANNEL_MAX = 1.34;
+const PARTICLE_VISUAL_SPEED_MAX = 24;
+const PARTICLE_ACTIVITY_THRESHOLD = 0.028;
+const PARTICLE_ACTIVITY_SCALE = 11.5;
+const PARTICLE_ACTIVITY_MIX_GAIN = 0.95;
+const PARTICLE_ACTIVITY_WAKE_GAIN = 1.1;
+const PARTICLE_ACTIVITY_ASSIGN_THRESHOLD = 0.1;
 const FLUID_IMPULSE_STRENGTH = 0.22;
 const FLUID_COUPLING_BASE = 0.06;
 const FLUID_COUPLING_WAKE = 0.2;
@@ -86,10 +103,16 @@ const FLUID_MIN_IMPULSE_PX = 12;
 
 const container = document.getElementById("app");
 if (!container) throw new Error("Missing #app container");
+const tuningPanel = document.getElementById("tuning-panel");
 const frictionInput = document.getElementById("tuning-friction");
 const frictionNumberInput = document.getElementById("tuning-friction-number");
+const viscosityInput = document.getElementById("tuning-viscosity");
+const viscosityNumberInput = document.getElementById("tuning-viscosity-number");
 const radiusInput = document.getElementById("tuning-radius");
 const radiusNumberInput = document.getElementById("tuning-radius-number");
+const showCursorInput = document.getElementById("tuning-show-cursor");
+const activityGainInput = document.getElementById("tuning-activity-gain");
+const activityGainNumberInput = document.getElementById("tuning-activity-gain-number");
 const particleCountInput = document.getElementById("tuning-particle-count");
 const particleCountNumberInput = document.getElementById("tuning-particle-count-number");
 const particleSizeInput = document.getElementById("tuning-particle-size");
@@ -126,7 +149,7 @@ composer.addPass(bloomPass);
 const logoRig = new THREE.Group();
 scene.add(logoRig);
 const cursorSphere = createCursorSphere();
-logoRig.add(cursorSphere);
+scene.add(cursorSphere);
 
 const backgroundHalo = new THREE.Sprite(
   new THREE.SpriteMaterial({
@@ -159,11 +182,11 @@ let letterEntries = [];
 let letterColliders = [];
 let particleSystem = null;
 let particleMaterial = null;
+let gpuParticleController = null;
 let particleCount = 0;
 let particleTargetCount = 0;
 let particlePositions = new Float32Array(0);
 let particleVelocities = new Float32Array(0);
-let particleColors = new Float32Array(0);
 let particleSeeds = new Float32Array(0);
 let particleTurbulence = new Float32Array(0);
 let particleMass = new Float32Array(0);
@@ -171,7 +194,8 @@ let particleColorMix = new Float32Array(0);
 let particleWake = new Float32Array(0);
 let particleHitCooldown = new Float32Array(0);
 let particleSizeVariance = new Float32Array(0);
-let particleAssignedColors = new Float32Array(0);
+let particleVisualState = new Uint8Array(0);
+let particleAssignedColorBytes = new Uint8Array(0);
 let particleAssignedIntensity = new Float32Array(0);
 let particleAssignedLetter = new Int16Array(0);
 let particleSpin = new Float32Array(0);
@@ -183,9 +207,11 @@ let fluidPressure = new Float32Array(FLUID_CELL_COUNT);
 let fluidPressureNext = new Float32Array(FLUID_CELL_COUNT);
 let fluidDivergence = new Float32Array(FLUID_CELL_COUNT);
 let gpuFluid = null;
+let particleFluidTexture = null;
+let particleFluidTextureDirty = true;
 let positionAttr = null;
-let colorAttr = null;
 let sizeVarianceAttr = null;
+let particleReferenceAttr = null;
 let isMobileLayout = false;
 let logoBounds = new THREE.Vector3(420, 180, 70);
 let particleField = new THREE.Vector3(520, 220, 360);
@@ -210,16 +236,26 @@ const pointer = {
   rayDirLocal: new THREE.Vector3(0, 0, -1),
   speed: 0
 };
+const pointerViewport = {
+  left: 0,
+  top: 0,
+  width: 1,
+  height: 1,
+  centerOffsetX: 0
+};
 const pendingFluidImpulses = [];
 
 const tmpV1 = new THREE.Vector3();
 const tmpV2 = new THREE.Vector3();
 const tmpV3 = new THREE.Vector3();
 const tmpV4 = new THREE.Vector3();
+const tmpCursorWorld = new THREE.Vector3();
 const tmpFlowA = new THREE.Vector2();
 const tmpFlowB = new THREE.Vector2();
 const tmpFlowC = new THREE.Vector2();
 const tmpBoundaryForce = new THREE.Vector3();
+const tmpCursorHalfExtents = new THREE.Vector3();
+const tmpCursorNormal = new THREE.Vector3();
 const box = new THREE.Box3();
 const clock = new THREE.Clock();
 const cycleBaseColor = new THREE.Color();
@@ -228,11 +264,133 @@ const wordmarkColliderMin = new THREE.Vector3();
 const wordmarkColliderMax = new THREE.Vector3();
 const letterPalette = Array.from({ length: LETTER_COUNT }, () => new THREE.Color());
 const letterAccentPalette = Array.from({ length: LETTER_COUNT }, () => new THREE.Color());
+const particleFluidTextureData = new Float32Array(FLUID_CELL_COUNT * 4);
 cycleBaseColor.copy(TEAL);
 cycleInnerColor.copy(TEAL_SOFT);
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
+}
+
+function packNormalizedByte(value) {
+  return Math.round(clamp(value, 0, 1) * 255);
+}
+
+function clearParticleAssignedColor(index) {
+  const o = index * 3;
+  particleAssignedColorBytes[o] = 0;
+  particleAssignedColorBytes[o + 1] = 0;
+  particleAssignedColorBytes[o + 2] = 0;
+}
+
+function setParticleAssignedColor(index, color) {
+  const o = index * 3;
+  particleAssignedColorBytes[o] = packNormalizedByte(color.r);
+  particleAssignedColorBytes[o + 1] = packNormalizedByte(color.g);
+  particleAssignedColorBytes[o + 2] = packNormalizedByte(color.b);
+}
+
+function setParticleVisualState(index, mix, wake, emissionMix, speed) {
+  const o = index * 4;
+  particleVisualState[o] = packNormalizedByte(mix);
+  particleVisualState[o + 1] = packNormalizedByte(wake);
+  particleVisualState[o + 2] = packNormalizedByte(emissionMix);
+  particleVisualState[o + 3] = packNormalizedByte(speed / PARTICLE_VISUAL_SPEED_MAX);
+}
+
+function getParticleTextureSize(count) {
+  const width = Math.ceil(Math.sqrt(Math.max(count, 1)));
+  const height = Math.ceil(count / width);
+  return { width, height };
+}
+
+function ensureParticleFluidTexture() {
+  if (particleFluidTexture) return particleFluidTexture;
+  particleFluidTexture = new THREE.DataTexture(
+    particleFluidTextureData,
+    FLUID_COLS,
+    FLUID_ROWS,
+    THREE.RGBAFormat,
+    THREE.FloatType
+  );
+  particleFluidTexture.wrapS = THREE.ClampToEdgeWrapping;
+  particleFluidTexture.wrapT = THREE.ClampToEdgeWrapping;
+  particleFluidTexture.minFilter = THREE.LinearFilter;
+  particleFluidTexture.magFilter = THREE.LinearFilter;
+  particleFluidTexture.needsUpdate = true;
+  return particleFluidTexture;
+}
+
+function markParticleFluidTextureDirty() {
+  particleFluidTextureDirty = true;
+}
+
+function syncParticleFluidTexture() {
+  const texture = ensureParticleFluidTexture();
+  if (!particleFluidTextureDirty) return texture;
+
+  for (let i = 0; i < FLUID_CELL_COUNT; i++) {
+    const o = i * 4;
+    particleFluidTextureData[o] = fluidVelocityX[i];
+    particleFluidTextureData[o + 1] = fluidVelocityY[i];
+    particleFluidTextureData[o + 2] = 0;
+    particleFluidTextureData[o + 3] = 1;
+  }
+
+  texture.needsUpdate = true;
+  particleFluidTextureDirty = false;
+  return texture;
+}
+
+function makeLetterColorLookupGLSL(uniformName) {
+  const cases = [];
+  for (let i = 0; i < LETTER_COUNT; i++) {
+    cases.push(`if (index < ${i + 0.5}) return ${uniformName}[${i}];`);
+  }
+  return `
+vec3 sampleLetterColor(const float index) {
+  ${cases.join("\n  ")}
+  return ${uniformName}[${Math.max(LETTER_COUNT - 1, 0)}];
+}
+`;
+}
+
+function makeClosestLetterIndexGLSL() {
+  return `
+float getClosestLetterIndex(const vec3 position) {
+  float bestIndex = 0.0;
+  float bestScore = 1e20;
+  for (int i = 0; i < ${LETTER_COUNT}; i++) {
+    vec3 halfExtents = max(uLetterHalfExtents[i].xyz, vec3(0.0001));
+    vec3 delta = (position - uLetterCenters[i].xyz) / halfExtents;
+    float score = dot(delta, delta);
+    if (score < bestScore) {
+      bestScore = score;
+      bestIndex = float(i);
+    }
+  }
+  return bestIndex;
+}
+`;
+}
+
+function makeNearestLetterColorGLSL() {
+  return `
+vec3 sampleNearestLetterColor(const vec3 position) {
+  float bestScore = 1e20;
+  vec3 bestColor = uLetterColors[0];
+  for (int i = 0; i < ${LETTER_COUNT}; i++) {
+    vec3 halfExtents = max(uLetterHalfExtents[i].xyz, vec3(0.0001));
+    vec3 delta = (position - uLetterCenters[i].xyz) / halfExtents;
+    float score = dot(delta, delta);
+    if (score < bestScore) {
+      bestScore = score;
+      bestColor = uLetterColors[i];
+    }
+  }
+  return bestColor;
+}
+`;
 }
 
 function hash(value) {
@@ -248,6 +406,53 @@ function normalizedBoundaryProximity(value, bound, start) {
   return clamp((Math.abs(value) / Math.max(bound, 1) - start) / (1 - start), 0, 1);
 }
 
+function getCursorHalfExtents(hitRadius, target) {
+  target.set(
+    Math.max(hitRadius * CURSOR_BOX_SCALE_X, 0.001),
+    Math.max(hitRadius * CURSOR_BOX_SCALE_Y, 0.001),
+    Math.max(hitRadius * CURSOR_BOX_SCALE_Z, 0.001)
+  );
+  return target;
+}
+
+function sampleRoundedBoxField(px, py, pz, halfExtents, normalTarget) {
+  const roundRadius = Math.min(
+    halfExtents.x,
+    halfExtents.y,
+    halfExtents.z
+  ) * CURSOR_BOX_ROUNDNESS;
+  const coreX = Math.max(halfExtents.x - roundRadius, 0.0001);
+  const coreY = Math.max(halfExtents.y - roundRadius, 0.0001);
+  const coreZ = Math.max(halfExtents.z - roundRadius, 0.0001);
+  const ax = Math.abs(px);
+  const ay = Math.abs(py);
+  const az = Math.abs(pz);
+  const qx = ax - coreX;
+  const qy = ay - coreY;
+  const qz = az - coreZ;
+  const ox = Math.max(qx, 0);
+  const oy = Math.max(qy, 0);
+  const oz = Math.max(qz, 0);
+  const outsideSq = ox * ox + oy * oy + oz * oz;
+  const outsideDist = Math.sqrt(outsideSq);
+  const insideMax = Math.min(Math.max(qx, Math.max(qy, qz)), 0);
+
+  if (outsideSq > 0.000001) {
+    const clampedX = clamp(px, -coreX, coreX);
+    const clampedY = clamp(py, -coreY, coreY);
+    const clampedZ = clamp(pz, -coreZ, coreZ);
+    normalTarget.set(px - clampedX, py - clampedY, pz - clampedZ).normalize();
+  } else if (qx >= qy && qx >= qz) {
+    normalTarget.set(px < 0 ? -1 : 1, 0, 0);
+  } else if (qy >= qz) {
+    normalTarget.set(0, py < 0 ? -1 : 1, 0);
+  } else {
+    normalTarget.set(0, 0, pz < 0 ? -1 : 1);
+  }
+
+  return outsideDist + insideMax - roundRadius;
+}
+
 function applyEdgeCornerRepulsion(px, py, pz, velocity, boundX, boundY, boundZ, seed, time, frame) {
   const signX = px < 0 ? -1 : 1;
   const signY = py < 0 ? -1 : 1;
@@ -255,9 +460,6 @@ function applyEdgeCornerRepulsion(px, py, pz, velocity, boundX, boundY, boundZ, 
   const nearX = normalizedBoundaryProximity(px, boundX, EDGE_REPEL_START);
   const nearY = normalizedBoundaryProximity(py, boundY, EDGE_REPEL_START);
   const nearZ = normalizedBoundaryProximity(pz, boundZ, EDGE_REPEL_START);
-  const cornerX = normalizedBoundaryProximity(px, boundX, CORNER_REPEL_START);
-  const cornerY = normalizedBoundaryProximity(py, boundY, CORNER_REPEL_START);
-  const cornerZ = normalizedBoundaryProximity(pz, boundZ, CORNER_REPEL_START);
 
   let dampX = 1;
   let dampY = 1;
@@ -295,21 +497,6 @@ function applyEdgeCornerRepulsion(px, py, pz, velocity, boundX, boundY, boundZ, 
     tmpBoundaryForce.x += burst;
     dampY -= edgeYZ * EDGE_REPEL_DAMP;
     dampZ -= edgeYZ * EDGE_REPEL_DAMP;
-  }
-
-  const corner = cornerX * cornerY * cornerZ;
-  if (corner > 0) {
-    const force = CORNER_REPEL_FORCE * corner * corner * frame;
-    const jitter = CORNER_REPEL_JITTER * corner * frame;
-    tmpBoundaryForce.x -= signX * force;
-    tmpBoundaryForce.y -= signY * force;
-    tmpBoundaryForce.z -= signZ * force;
-    tmpBoundaryForce.x += Math.sin(seed * 29.9 + time * 5.1) * jitter;
-    tmpBoundaryForce.y += Math.cos(seed * 31.7 - time * 4.7) * jitter;
-    tmpBoundaryForce.z += Math.sin(seed * 37.1 + time * 5.7) * jitter;
-    dampX -= corner * CORNER_REPEL_DAMP;
-    dampY -= corner * CORNER_REPEL_DAMP;
-    dampZ -= corner * CORNER_REPEL_DAMP;
   }
 
   velocity.x = velocity.x * clamp(dampX, 0.72, 1) + tmpBoundaryForce.x;
@@ -392,6 +579,28 @@ function applyWordmarkRepulsion(px, py, pz, velocity, frame) {
   return touched;
 }
 
+function getClosestLetterIndex(px, py, pz) {
+  if (letterColliders.length === 0) return 0;
+
+  let bestIndex = 0;
+  let bestScore = Infinity;
+
+  for (let i = 0; i < letterColliders.length; i++) {
+    const collider = letterColliders[i];
+    const dx = (px - collider.centerX) / Math.max(collider.halfX, 1);
+    const dy = (py - collider.centerY) / Math.max(collider.halfY, 1);
+    const dz = (pz - collider.centerZ) / Math.max(collider.halfZ, 1);
+    const score = dx * dx + dy * dy + dz * dz;
+
+    if (score < bestScore) {
+      bestScore = score;
+      bestIndex = i;
+    }
+  }
+
+  return bestIndex;
+}
+
 function normalizeParticleCount(value) {
   const snapped = Math.round(value / COUNT_STEP) * COUNT_STEP;
   return clamp(snapped, PARTICLE_COUNT_MIN, PARTICLE_COUNT_MAX);
@@ -401,11 +610,19 @@ function normalizeParticleSize(value) {
   return clamp(value, PARTICLE_SIZE_MIN, PARTICLE_SIZE_MAX);
 }
 
+function normalizeActivityGain(value) {
+  return clamp(value, ACTIVITY_GAIN_MIN, ACTIVITY_GAIN_MAX);
+}
+
+function normalizeViscosity(value) {
+  return clamp(value, VISCOSITY_MIN, VISCOSITY_MAX);
+}
+
 function normalizeParticleSizeRandomness(value) {
   return clamp(value, PARTICLE_SIZE_RANDOMNESS_MIN, PARTICLE_SIZE_RANDOMNESS_MAX);
 }
 
-function getBaseParticleSize() {
+function getLegacyBaseParticleSize() {
   return isMobileLayout ? 12.8 : 9.8;
 }
 
@@ -417,25 +634,74 @@ function getEffectiveFriction() {
   );
 }
 
+function getEffectiveFluidDecay() {
+  const shapedViscosity = motionTuning.viscosity * (0.35 + motionTuning.viscosity * 0.65);
+  return clamp(0.995 - shapedViscosity * 0.055, 0.94, 0.995);
+}
+
 function updateParticleMaterialTuning() {
   if (!particleMaterial) return;
-  particleMaterial.size = getBaseParticleSize();
   const sizeUniforms = particleMaterial.userData.sizeUniforms;
   if (!sizeUniforms) return;
+  const visualDensity = getParticleVisualDensity(
+    particleCount || particleTargetCount || BASE_PARTICLES,
+    motionTuning.particleSize
+  );
   sizeUniforms.uParticleSizeScale.value = motionTuning.particleSize;
   sizeUniforms.uParticleSizeRandomness.value = motionTuning.particleSizeRandomness;
+  sizeUniforms.uViewportScale.value = renderer.domElement.height * 0.5;
+  sizeUniforms.uParticleDensitySize.value = visualDensity.size;
+  sizeUniforms.uParticleDensityAlpha.value = visualDensity.alpha;
+  sizeUniforms.uParticleDensityGlow.value = visualDensity.glow;
+  sizeUniforms.uParticleDensityWhite.value = visualDensity.white;
+}
+
+function getParticleSoftBounds(target) {
+  target.set(
+    viewportBounds.x * OUTER_SHELL_SCALE_XY,
+    viewportBounds.y * OUTER_SHELL_SCALE_XY,
+    particleField.z
+  );
+  return target;
+}
+
+function getParticleHardBounds(target) {
+  return target.set(
+    viewportBounds.x * OUTER_SHELL_SCALE_XY * PARTICLE_HARD_BOUND_SCALE_XY,
+    viewportBounds.y * OUTER_SHELL_SCALE_XY * PARTICLE_HARD_BOUND_SCALE_XY,
+    particleField.z * PARTICLE_HARD_BOUND_SCALE_Z
+  );
 }
 
 function getMaxCursorRadius() {
-  return Math.max(0, Math.min(viewportBounds.x, viewportBounds.y, particleField.z) - 2);
+  return Math.max(0, Math.min(viewportBounds.x, viewportBounds.y) - 2);
+}
+
+function getParticleVisualDensity(count, particleSize) {
+  const referenceCount = 80000;
+  const referenceSize = 5.8;
+  const relativeCoverage = Math.max(
+    (Math.max(count, 1) * Math.max(particleSize, 1) * Math.max(particleSize, 1)) /
+      (referenceCount * referenceSize * referenceSize),
+    1
+  );
+  return {
+    size: clamp(Math.pow(1 / relativeCoverage, 0.12), 0.72, 1),
+    alpha: clamp(Math.pow(1 / relativeCoverage, 0.78), 0.05, 1),
+    glow: clamp(Math.pow(1 / relativeCoverage, 0.52), 0.18, 1),
+    white: clamp(Math.pow(1 / relativeCoverage, 0.92), 0.02, 1)
+  };
 }
 
 function loadMotionTuning() {
   const defaults = {
     friction: 0.5,
+    viscosity: 0.5,
     radius: 0.2,
+    showCursor: true,
+    activityGain: 1.9,
     particleCount: null,
-    particleSize: 1,
+    particleSize: 9.8,
     particleSizeRandomness: 0.35
   };
   try {
@@ -443,7 +709,10 @@ function loadMotionTuning() {
     if (!raw) return defaults;
     const parsed = JSON.parse(raw);
     const parsedFriction = Number(parsed.friction);
+    const parsedViscosity = Number(parsed.viscosity);
     const parsedRadius = Number(parsed.radius);
+    const parsedShowCursor = parsed.showCursor;
+    const parsedActivityGain = Number(parsed.activityGain);
     const parsedParticleCount = parsed.particleCount == null ? null : Number(parsed.particleCount);
     const parsedParticleSize = Number(parsed.particleSize);
     const parsedParticleSizeRandomness = Number(parsed.particleSizeRandomness);
@@ -456,14 +725,27 @@ function loadMotionTuning() {
       friction: Number.isFinite(parsedFriction)
         ? clamp(parsedFriction, FRICTION_MIN, FRICTION_MAX)
         : defaults.friction,
+      viscosity: Number.isFinite(parsedViscosity)
+        ? normalizeViscosity(parsedViscosity)
+        : defaults.viscosity,
       radius: Number.isFinite(normalizedRadius)
         ? clamp(normalizedRadius < RADIUS_MIN ? defaults.radius : normalizedRadius, RADIUS_MIN, RADIUS_MAX)
         : defaults.radius,
+      showCursor: typeof parsedShowCursor === "boolean"
+        ? parsedShowCursor
+        : defaults.showCursor,
+      activityGain: Number.isFinite(parsedActivityGain)
+        ? normalizeActivityGain(parsedActivityGain)
+        : defaults.activityGain,
       particleCount: parsedParticleCount != null && Number.isFinite(parsedParticleCount)
         ? normalizeParticleCount(parsedParticleCount)
         : defaults.particleCount,
       particleSize: Number.isFinite(parsedParticleSize)
-        ? normalizeParticleSize(parsedParticleSize)
+        ? normalizeParticleSize(
+          parsedParticleSize <= 2.5
+            ? getLegacyBaseParticleSize() * parsedParticleSize
+            : parsedParticleSize
+        )
         : defaults.particleSize,
       particleSizeRandomness: Number.isFinite(parsedParticleSizeRandomness)
         ? normalizeParticleSizeRandomness(parsedParticleSizeRandomness)
@@ -484,14 +766,19 @@ function saveMotionTuning() {
 
 function syncTuningPanel() {
   const displayParticleCount = motionTuning.particleCount ?? (particleTargetCount || particleCount || BASE_PARTICLES);
-  if (frictionInput) frictionInput.value = motionTuning.friction.toFixed(3);
-  if (frictionNumberInput) frictionNumberInput.value = (motionTuning.friction * 100).toFixed(1);
+  if (frictionInput) frictionInput.value = motionTuning.friction.toFixed(4);
+  if (frictionNumberInput) frictionNumberInput.value = (motionTuning.friction * 100).toFixed(2);
+  if (viscosityInput) viscosityInput.value = motionTuning.viscosity.toFixed(3);
+  if (viscosityNumberInput) viscosityNumberInput.value = (motionTuning.viscosity * 100).toFixed(0);
   if (radiusInput) radiusInput.value = motionTuning.radius.toFixed(3);
   if (radiusNumberInput) radiusNumberInput.value = (motionTuning.radius * 100).toFixed(0);
+  if (showCursorInput) showCursorInput.checked = motionTuning.showCursor !== false;
+  if (activityGainInput) activityGainInput.value = motionTuning.activityGain.toFixed(2);
+  if (activityGainNumberInput) activityGainNumberInput.value = (motionTuning.activityGain * 100).toFixed(0);
   if (particleCountInput) particleCountInput.value = String(displayParticleCount);
   if (particleCountNumberInput) particleCountNumberInput.value = String(displayParticleCount);
-  if (particleSizeInput) particleSizeInput.value = motionTuning.particleSize.toFixed(2);
-  if (particleSizeNumberInput) particleSizeNumberInput.value = (motionTuning.particleSize * 100).toFixed(0);
+  if (particleSizeInput) particleSizeInput.value = motionTuning.particleSize.toFixed(1);
+  if (particleSizeNumberInput) particleSizeNumberInput.value = motionTuning.particleSize.toFixed(1);
   if (particleSizeRandomnessInput) {
     particleSizeRandomnessInput.value = motionTuning.particleSizeRandomness.toFixed(2);
   }
@@ -508,9 +795,30 @@ function setupTuningPanel() {
     saveMotionTuning();
   };
 
+  const applyViscosity = (value) => {
+    if (!Number.isFinite(value)) return;
+    motionTuning.viscosity = normalizeViscosity(value);
+    syncTuningPanel();
+    gpuFluid?.updateDimensions();
+    saveMotionTuning();
+  };
+
   const applyRadius = (value) => {
     if (!Number.isFinite(value)) return;
     motionTuning.radius = clamp(value, RADIUS_MIN, RADIUS_MAX);
+    syncTuningPanel();
+    saveMotionTuning();
+  };
+
+  const applyShowCursor = (value) => {
+    motionTuning.showCursor = value !== false;
+    syncTuningPanel();
+    saveMotionTuning();
+  };
+
+  const applyActivityGain = (value) => {
+    if (!Number.isFinite(value)) return;
+    motionTuning.activityGain = normalizeActivityGain(value);
     syncTuningPanel();
     saveMotionTuning();
   };
@@ -545,6 +853,10 @@ function setupTuningPanel() {
     applyFriction(Number(frictionInput.value));
   });
 
+  viscosityInput?.addEventListener("input", () => {
+    applyViscosity(Number(viscosityInput.value));
+  });
+
   radiusInput?.addEventListener("input", () => {
     applyRadius(Number(radiusInput.value));
   });
@@ -557,12 +869,36 @@ function setupTuningPanel() {
     applyFriction(Number(frictionNumberInput.value) / 100);
   });
 
+  viscosityNumberInput?.addEventListener("input", () => {
+    applyViscosity(Number(viscosityNumberInput.value) / 100);
+  });
+
+  viscosityNumberInput?.addEventListener("change", () => {
+    applyViscosity(Number(viscosityNumberInput.value) / 100);
+  });
+
   radiusNumberInput?.addEventListener("input", () => {
     applyRadius(Number(radiusNumberInput.value) / 100);
   });
 
   radiusNumberInput?.addEventListener("change", () => {
     applyRadius(Number(radiusNumberInput.value) / 100);
+  });
+
+  showCursorInput?.addEventListener("change", () => {
+    applyShowCursor(showCursorInput.checked);
+  });
+
+  activityGainInput?.addEventListener("input", () => {
+    applyActivityGain(Number(activityGainInput.value));
+  });
+
+  activityGainNumberInput?.addEventListener("input", () => {
+    applyActivityGain(Number(activityGainNumberInput.value) / 100);
+  });
+
+  activityGainNumberInput?.addEventListener("change", () => {
+    applyActivityGain(Number(activityGainNumberInput.value) / 100);
   });
 
   particleCountInput?.addEventListener("input", () => {
@@ -582,11 +918,11 @@ function setupTuningPanel() {
   });
 
   particleSizeNumberInput?.addEventListener("input", () => {
-    applyParticleSize(Number(particleSizeNumberInput.value) / 100);
+    applyParticleSize(Number(particleSizeNumberInput.value));
   });
 
   particleSizeNumberInput?.addEventListener("change", () => {
-    applyParticleSize(Number(particleSizeNumberInput.value) / 100);
+    applyParticleSize(Number(particleSizeNumberInput.value));
   });
 
   particleSizeRandomnessInput?.addEventListener("input", () => {
@@ -675,24 +1011,44 @@ function createParticleSpriteTexture(sizePx) {
 
   ctx.clearRect(0, 0, sizePx, sizePx);
   const center = sizePx * 0.5;
-  const radius = sizePx * 0.46;
+  const radius = sizePx * 0.49;
 
   const shadow = ctx.createRadialGradient(
     center,
     center,
-    sizePx * 0.06,
+    sizePx * 0.02,
     center,
     center,
     radius
   );
   shadow.addColorStop(0, "rgba(255,255,255,1)");
-  shadow.addColorStop(0.2, "rgba(255,255,255,0.98)");
-  shadow.addColorStop(0.55, "rgba(255,255,255,0.72)");
-  shadow.addColorStop(0.82, "rgba(255,255,255,0.18)");
+  shadow.addColorStop(0.68, "rgba(255,255,255,1)");
+  shadow.addColorStop(0.78, "rgba(255,255,255,0.98)");
+  shadow.addColorStop(0.84, "rgba(255,255,255,0.2)");
+  shadow.addColorStop(0.88, "rgba(255,255,255,0)");
   shadow.addColorStop(1, "rgba(255,255,255,0)");
   ctx.fillStyle = shadow;
   ctx.beginPath();
   ctx.arc(center, center, radius, 0, Math.PI * 2);
+  ctx.fill();
+
+  const halo = ctx.createRadialGradient(
+    center,
+    center,
+    sizePx * 0.18,
+    center,
+    center,
+    sizePx * 0.5
+  );
+  halo.addColorStop(0, "rgba(255,255,255,0)");
+  halo.addColorStop(0.78, "rgba(255,255,255,0)");
+  halo.addColorStop(0.88, "rgba(255,255,255,0.06)");
+  halo.addColorStop(0.96, "rgba(255,255,255,0.18)");
+  halo.addColorStop(0.995, "rgba(255,255,255,0.02)");
+  halo.addColorStop(1, "rgba(255,255,255,0)");
+  ctx.fillStyle = halo;
+  ctx.beginPath();
+  ctx.arc(center, center, sizePx * 0.5, 0, Math.PI * 2);
   ctx.fill();
 
   const highlight = ctx.createRadialGradient(
@@ -703,8 +1059,8 @@ function createParticleSpriteTexture(sizePx) {
     center - sizePx * 0.14,
     sizePx * 0.24
   );
-  highlight.addColorStop(0, "rgba(255,255,255,0.92)");
-  highlight.addColorStop(0.45, "rgba(255,255,255,0.34)");
+  highlight.addColorStop(0, "rgba(255,255,255,0.2)");
+  highlight.addColorStop(0.28, "rgba(255,255,255,0.04)");
   highlight.addColorStop(1, "rgba(255,255,255,0)");
   ctx.fillStyle = highlight;
   ctx.beginPath();
@@ -715,6 +1071,497 @@ function createParticleSpriteTexture(sizePx) {
   texture.colorSpace = THREE.SRGBColorSpace;
   texture.needsUpdate = true;
   return texture;
+}
+
+function buildParticleSimulationCommonGLSL() {
+  return `
+uniform sampler2D uParticleBaseTexture;
+uniform sampler2D uFluidTexture;
+uniform float uParticleCount;
+uniform float uTime;
+uniform float uDeltaTime;
+uniform float uFrameScale;
+uniform float uEffectiveFriction;
+uniform float uActivityGain;
+uniform float uPointerActive;
+uniform float uPointerEnergy;
+uniform float uHitRadius;
+uniform vec3 uPointerPosition;
+uniform vec3 uOuterBounds;
+uniform vec2 uViewportBounds;
+
+float hash11(const float value) {
+  return fract(sin(value * 127.1) * 43758.5453123);
+}
+
+float normalizedBoundaryProximity(const float value, const float bound, const float start) {
+  return clamp((abs(value) / max(bound, 1.0) - start) / (1.0 - start), 0.0, 1.0);
+}
+
+vec2 particleUv() {
+  return gl_FragCoord.xy / resolution.xy;
+}
+
+float particleIndex() {
+  vec2 coord = gl_FragCoord.xy - vec2(0.5);
+  return coord.y * resolution.x + coord.x;
+}
+
+vec2 fluidUvForWorld(const vec2 world) {
+  return clamp((world + uViewportBounds) / (uViewportBounds * 2.0), 0.0, 1.0);
+}
+
+vec2 sampleFluidField(const vec3 position, const float seed) {
+  float sampleOffsetX =
+    sin(seed * 11.7 + position.z * 0.006 + uTime * 0.14) * 4.8 +
+    sin(seed * 23.1 - position.y * 0.012 - uTime * 0.48) * 2.2;
+  float sampleOffsetY =
+    cos(seed * 13.1 + position.z * 0.005 - uTime * 0.11) * 4.8 +
+    cos(seed * 19.7 + position.x * 0.014 + uTime * 0.41) * 2.2;
+
+  vec2 flowA = texture2D(uFluidTexture, fluidUvForWorld(vec2(position.x + sampleOffsetX, position.y + sampleOffsetY))).xy;
+  vec2 flowB = texture2D(uFluidTexture, fluidUvForWorld(vec2(position.x - sampleOffsetY * 0.45, position.y + sampleOffsetX * 0.45))).xy;
+  return mix(flowA, flowB, 0.35);
+}
+
+void applyEdgeRepulsion(const vec3 position, const float seed, inout vec3 velocity) {
+  float signX = position.x < 0.0 ? -1.0 : 1.0;
+  float signY = position.y < 0.0 ? -1.0 : 1.0;
+  float signZ = position.z < 0.0 ? -1.0 : 1.0;
+  float nearX = normalizedBoundaryProximity(position.x, uOuterBounds.x, ${EDGE_REPEL_START.toFixed(6)});
+  float nearY = normalizedBoundaryProximity(position.y, uOuterBounds.y, ${EDGE_REPEL_START.toFixed(6)});
+  float nearZ = normalizedBoundaryProximity(position.z, uOuterBounds.z, ${EDGE_REPEL_START.toFixed(6)});
+
+  vec3 boundaryForce = vec3(0.0);
+  float dampX = 1.0;
+  float dampY = 1.0;
+  float dampZ = 1.0;
+
+  if (nearX > 0.0) {
+    float force = ${EDGE_REPEL_FORCE.toFixed(6)} * nearX * nearX * uFrameScale;
+    float jitter = ${EDGE_REPEL_JITTER.toFixed(6)} * nearX * uFrameScale;
+    boundaryForce.x -= signX * force;
+    boundaryForce.y += sin(seed * 19.7 + uTime * 3.3) * jitter * 0.4;
+    boundaryForce.z += cos(seed * 27.1 - uTime * 2.9) * jitter * 0.25;
+    dampX -= nearX * ${EDGE_REPEL_DAMP.toFixed(6)};
+  }
+  if (nearY > 0.0) {
+    float force = ${EDGE_REPEL_FORCE.toFixed(6)} * nearY * nearY * uFrameScale;
+    float jitter = ${EDGE_REPEL_JITTER.toFixed(6)} * nearY * uFrameScale;
+    boundaryForce.y -= signY * force;
+    boundaryForce.x += cos(seed * 23.3 + uTime * 3.7) * jitter * 0.4;
+    boundaryForce.z += sin(seed * 31.9 - uTime * 2.5) * jitter * 0.25;
+    dampY -= nearY * ${EDGE_REPEL_DAMP.toFixed(6)};
+  }
+  if (nearZ > 0.0) {
+    float force = ${EDGE_REPEL_FORCE.toFixed(6)} * nearZ * nearZ * uFrameScale * 0.6;
+    float jitter = ${EDGE_REPEL_JITTER.toFixed(6)} * nearZ * uFrameScale * 0.5;
+    boundaryForce.z -= signZ * force;
+    boundaryForce.x += sin(seed * 17.1 - uTime * 2.8) * jitter * 0.35;
+    boundaryForce.y += cos(seed * 13.9 + uTime * 3.1) * jitter * 0.35;
+    dampZ -= nearZ * ${EDGE_REPEL_DAMP.toFixed(6)};
+  }
+
+  float edgeXY = nearX * nearY;
+  float edgeXZ = nearX * nearZ;
+  float edgeYZ = nearY * nearZ;
+  if (edgeXY > 0.0) {
+    boundaryForce.x -= signX * ${EDGE_REPEL_FORCE.toFixed(6)} * edgeXY * edgeXY * uFrameScale * 0.55;
+    boundaryForce.y -= signY * ${EDGE_REPEL_FORCE.toFixed(6)} * edgeXY * edgeXY * uFrameScale * 0.55;
+    dampX -= edgeXY * ${EDGE_REPEL_DAMP.toFixed(6)};
+    dampY -= edgeXY * ${EDGE_REPEL_DAMP.toFixed(6)};
+  }
+  if (edgeXZ > 0.0) {
+    boundaryForce.x -= signX * ${EDGE_REPEL_FORCE.toFixed(6)} * edgeXZ * edgeXZ * uFrameScale * 0.4;
+    boundaryForce.z -= signZ * ${EDGE_REPEL_FORCE.toFixed(6)} * edgeXZ * edgeXZ * uFrameScale * 0.4;
+    dampX -= edgeXZ * ${EDGE_REPEL_DAMP.toFixed(6)};
+    dampZ -= edgeXZ * ${EDGE_REPEL_DAMP.toFixed(6)};
+  }
+  if (edgeYZ > 0.0) {
+    boundaryForce.y -= signY * ${EDGE_REPEL_FORCE.toFixed(6)} * edgeYZ * edgeYZ * uFrameScale * 0.4;
+    boundaryForce.z -= signZ * ${EDGE_REPEL_FORCE.toFixed(6)} * edgeYZ * edgeYZ * uFrameScale * 0.4;
+    dampY -= edgeYZ * ${EDGE_REPEL_DAMP.toFixed(6)};
+    dampZ -= edgeYZ * ${EDGE_REPEL_DAMP.toFixed(6)};
+  }
+
+  velocity.x = velocity.x * clamp(dampX, 0.72, 1.0) + boundaryForce.x;
+  velocity.y = velocity.y * clamp(dampY, 0.72, 1.0) + boundaryForce.y;
+  velocity.z = velocity.z * clamp(dampZ, 0.72, 1.0) + boundaryForce.z;
+}
+
+void simulateVelocity(
+  const vec3 position,
+  const vec3 velocityIn,
+  const float seed,
+  const float turbulence,
+  const float mass,
+  const float spin,
+  const float colorMix,
+  const float wake,
+  out vec3 nextVelocity,
+  out float hitFalloff
+) {
+  vec3 velocity = velocityIn;
+  vec2 flow = sampleFluidField(position, seed);
+  float hitInfluence = max(colorMix, clamp(wake, 0.0, 1.0));
+  float fluidCoupling = (${FLUID_COUPLING_BASE.toFixed(6)} + hitInfluence * ${FLUID_COUPLING_WAKE.toFixed(6)}) * uFrameScale / max(mass, 0.0001);
+  float fluidRelax = clamp((${FLUID_RELAX_BASE.toFixed(6)} + hitInfluence * ${FLUID_RELAX_WAKE.toFixed(6)}) * uFrameScale / max(mass, 0.0001), 0.0, 0.12);
+  velocity.x += flow.x * fluidCoupling;
+  velocity.y += flow.y * fluidCoupling;
+  velocity.x += (flow.x - velocity.x) * fluidRelax;
+  velocity.y += (flow.y - velocity.y) * fluidRelax;
+
+  hitFalloff = 0.0;
+  if (uPointerActive > 0.5 && uPointerEnergy > 0.0001 && uHitRadius > 0.001) {
+    vec3 hit = position - uPointerPosition;
+    float hitDistSq = dot(hit, hit);
+    float hitRadiusSq = uHitRadius * uHitRadius;
+    if (hitDistSq < hitRadiusSq) {
+      float dist = sqrt(hitDistSq);
+      vec3 normal = dist > 0.0001
+        ? hit / dist
+        : normalize(vec3(hash11(seed * 3.1) - 0.5, hash11(seed * 7.7) - 0.5, hash11(seed * 11.9) - 0.5));
+      hitFalloff = pow(1.0 - hitDistSq / hitRadiusSq, 2.0);
+      float depthLift = uPointerEnergy * hitFalloff * 0.16 * uFrameScale;
+      velocity.x += normal.x * depthLift * 0.14;
+      velocity.y += normal.y * depthLift * 0.14;
+      velocity.z += normal.z * depthLift * 0.18 + (hash11(seed * 97.0) - 0.5) * depthLift * 0.08;
+    }
+  }
+
+  vec3 hardBounds = vec3(
+    uOuterBounds.xy * ${PARTICLE_HARD_BOUND_SCALE_XY.toFixed(6)},
+    uOuterBounds.z * ${PARTICLE_HARD_BOUND_SCALE_Z.toFixed(6)}
+  );
+
+  if (position.x < -hardBounds.x || position.x > hardBounds.x) {
+    velocity.x += (position.x < -hardBounds.x ? -hardBounds.x - position.x : hardBounds.x - position.x) * 0.09 * uFrameScale;
+    velocity.x *= 0.82;
+  }
+  if (position.y < -hardBounds.y || position.y > hardBounds.y) {
+    velocity.y += (position.y < -hardBounds.y ? -hardBounds.y - position.y : hardBounds.y - position.y) * 0.09 * uFrameScale;
+    velocity.y *= 0.82;
+  }
+  if (position.z < -hardBounds.z || position.z > hardBounds.z) {
+    velocity.z += (position.z < -hardBounds.z ? -hardBounds.z - position.z : hardBounds.z - position.z) * 0.035 * uFrameScale;
+    velocity.z *= 0.84;
+  }
+
+  float speed = length(velocity);
+  float planarSpeed = length(velocity.xy);
+  float eddy = wake * clamp(planarSpeed * 0.016 * turbulence, 0.0, 0.085) * uFrameScale;
+  if (eddy > 0.0001) {
+    float prevVx = velocity.x;
+    float prevVy = velocity.y;
+    velocity.z += sin(uTime * 1.55 + seed * 6.283) * eddy * 0.42;
+    velocity.x += -prevVy * spin * eddy * 0.08;
+    velocity.y += prevVx * spin * eddy * 0.08;
+  }
+
+  speed = length(velocity);
+  float dragBase = 0.994 - uEffectiveFriction * 0.018;
+  float dragMin = 0.968 - uEffectiveFriction * 0.036;
+  float dragMax = 0.998 - uEffectiveFriction * 0.004;
+  float drag = clamp(dragBase - speed * 0.00045 * uFrameScale - wake * 0.0026 * uFrameScale, dragMin, dragMax);
+  velocity.x *= drag;
+  velocity.y *= drag;
+  velocity.z *= clamp(drag - 0.008, 0.9, 0.988);
+
+  if (speed < 0.0025) {
+    velocity.x *= 0.8;
+    velocity.y *= 0.8;
+    velocity.z *= 0.72;
+  }
+
+  nextVelocity = velocity;
+}
+`;
+}
+
+function buildParticleVelocityShader() {
+  return `
+${buildParticleSimulationCommonGLSL()}
+void main() {
+  vec2 uv = particleUv();
+  if (particleIndex() >= uParticleCount) {
+    gl_FragColor = vec4(0.0);
+    return;
+  }
+
+  vec4 positionData = texture2D(textureParticlePosition, uv);
+  vec4 velocityData = texture2D(textureParticleVelocity, uv);
+  vec4 visualData = texture2D(textureParticleVisual, uv);
+  vec4 baseData = texture2D(uParticleBaseTexture, uv);
+
+  vec3 nextVelocity;
+  float hitFalloff;
+  simulateVelocity(
+    positionData.xyz,
+    velocityData.xyz,
+    baseData.x,
+    baseData.y,
+    baseData.z,
+    baseData.w * 2.0 - 1.0,
+    visualData.x,
+    visualData.y,
+    nextVelocity,
+    hitFalloff
+  );
+  gl_FragColor = vec4(nextVelocity, 1.0);
+}
+`;
+}
+
+function buildParticlePositionShader() {
+  return `
+${buildParticleSimulationCommonGLSL()}
+void main() {
+  vec2 uv = particleUv();
+  if (particleIndex() >= uParticleCount) {
+    gl_FragColor = vec4(0.0);
+    return;
+  }
+
+  vec4 positionData = texture2D(textureParticlePosition, uv);
+  vec4 velocityData = texture2D(textureParticleVelocity, uv);
+  vec4 visualData = texture2D(textureParticleVisual, uv);
+  vec4 baseData = texture2D(uParticleBaseTexture, uv);
+
+  vec3 nextVelocity;
+  float hitFalloff;
+  simulateVelocity(
+    positionData.xyz,
+    velocityData.xyz,
+    baseData.x,
+    baseData.y,
+    baseData.z,
+    baseData.w * 2.0 - 1.0,
+    visualData.x,
+    visualData.y,
+    nextVelocity,
+    hitFalloff
+  );
+  gl_FragColor = vec4(positionData.xyz + nextVelocity * uFrameScale, 0.0);
+}
+`;
+}
+
+function buildParticleVisualShader() {
+  return `
+${buildParticleSimulationCommonGLSL()}
+void main() {
+  vec2 uv = particleUv();
+  if (particleIndex() >= uParticleCount) {
+    gl_FragColor = vec4(0.0);
+    return;
+  }
+
+  vec4 positionData = texture2D(textureParticlePosition, uv);
+  vec4 velocityData = texture2D(textureParticleVelocity, uv);
+  vec4 visualData = texture2D(textureParticleVisual, uv);
+  vec4 baseData = texture2D(uParticleBaseTexture, uv);
+
+  vec3 nextVelocity;
+  float hitFalloff;
+  simulateVelocity(
+    positionData.xyz,
+    velocityData.xyz,
+    baseData.x,
+    baseData.y,
+    baseData.z,
+    baseData.w * 2.0 - 1.0,
+    visualData.x,
+    visualData.y,
+    nextVelocity,
+    hitFalloff
+  );
+
+  vec3 deltaVelocity = nextVelocity - velocityData.xyz;
+  float prevSpeed = length(velocityData.xyz);
+  float nextSpeed = length(nextVelocity);
+  float speedDelta = abs(nextSpeed - prevSpeed);
+  float directionalDelta = length(deltaVelocity);
+  float kineticSignal = max(speedDelta * 1.35, directionalDelta * 0.58);
+  float deltaActivity = clamp(
+    (kineticSignal - ${PARTICLE_ACTIVITY_THRESHOLD.toFixed(6)}) * ${PARTICLE_ACTIVITY_SCALE.toFixed(6)},
+    0.0,
+    1.0
+  );
+  float speedActivity = clamp(
+    (nextSpeed - 0.140000) * 1.650000,
+    0.0,
+    1.0
+  );
+  float sustainedActivity = speedActivity * speedActivity * (3.0 - 2.0 * speedActivity);
+  float rawActivityStrength = max(deltaActivity * 0.72, sustainedActivity);
+  float gainedActivity = clamp(rawActivityStrength * uActivityGain, 0.0, 1.0);
+  float gatedActivity = clamp((gainedActivity - 0.08) / 0.92, 0.0, 1.0);
+  gatedActivity = gatedActivity * gatedActivity * (3.0 - 2.0 * gatedActivity);
+  float activityStrength = pow(gatedActivity, 2.35);
+
+  float wake = clamp(pow(activityStrength, 0.92) * ${PARTICLE_ACTIVITY_WAKE_GAIN.toFixed(6)}, 0.0, 1.0);
+  float colorMix = clamp(pow(activityStrength, 0.78) * ${PARTICLE_ACTIVITY_MIX_GAIN.toFixed(6)}, 0.0, 1.0);
+  float intensity = clamp(
+    pow(activityStrength, 1.32) * (${PARTICLE_INTENSITY_MAX.toFixed(6)} * 0.22),
+    0.0,
+    ${PARTICLE_INTENSITY_MAX.toFixed(6)}
+  );
+  float assignedLetter = floor(
+    hash11(baseData.x * 97.0 + baseData.y * 53.0 + baseData.z * 19.0) * float(${LETTER_COUNT})
+  );
+
+  gl_FragColor = vec4(colorMix, wake, intensity, assignedLetter);
+}
+`;
+}
+
+function createGpuParticleController(count) {
+  const { width, height } = getParticleTextureSize(count);
+  const gpuCompute = new GPUComputationRenderer(width, height, renderer);
+  const positionTexture = gpuCompute.createTexture();
+  const velocityTexture = gpuCompute.createTexture();
+  const visualTexture = gpuCompute.createTexture();
+  const baseTexture = gpuCompute.createTexture();
+  const positionData = positionTexture.image.data;
+  const velocityData = velocityTexture.image.data;
+  const visualData = visualTexture.image.data;
+  const baseData = baseTexture.image.data;
+
+  for (let i = 0; i < width * height; i++) {
+    const o4 = i * 4;
+    const o3 = i * 3;
+    if (i < count) {
+      positionData[o4] = particlePositions[o3];
+      positionData[o4 + 1] = particlePositions[o3 + 1];
+      positionData[o4 + 2] = particlePositions[o3 + 2];
+      positionData[o4 + 3] = 0;
+
+      velocityData[o4] = particleVelocities[o3];
+      velocityData[o4 + 1] = particleVelocities[o3 + 1];
+      velocityData[o4 + 2] = particleVelocities[o3 + 2];
+      velocityData[o4 + 3] = 1;
+
+      visualData[o4] = 0;
+      visualData[o4 + 1] = 0;
+      visualData[o4 + 2] = 0;
+      visualData[o4 + 3] = -1;
+
+      baseData[o4] = particleSeeds[i];
+      baseData[o4 + 1] = particleTurbulence[i];
+      baseData[o4 + 2] = particleMass[i];
+      baseData[o4 + 3] = particleSpin[i] > 0 ? 1 : 0;
+    } else {
+      positionData[o4] = 0;
+      positionData[o4 + 1] = 0;
+      positionData[o4 + 2] = 999999;
+      positionData[o4 + 3] = 0;
+      velocityData[o4] = 0;
+      velocityData[o4 + 1] = 0;
+      velocityData[o4 + 2] = 0;
+      velocityData[o4 + 3] = 0;
+      visualData[o4] = 0;
+      visualData[o4 + 1] = 0;
+      visualData[o4 + 2] = 0;
+      visualData[o4 + 3] = -1;
+      baseData[o4] = 0;
+      baseData[o4 + 1] = 1;
+      baseData[o4 + 2] = 1;
+      baseData[o4 + 3] = 1;
+    }
+  }
+
+  baseTexture.needsUpdate = true;
+  baseTexture.minFilter = THREE.NearestFilter;
+  baseTexture.magFilter = THREE.NearestFilter;
+
+  const velocityVariable = gpuCompute.addVariable("textureParticleVelocity", buildParticleVelocityShader(), velocityTexture);
+  const positionVariable = gpuCompute.addVariable("textureParticlePosition", buildParticlePositionShader(), positionTexture);
+  const visualVariable = gpuCompute.addVariable("textureParticleVisual", buildParticleVisualShader(), visualTexture);
+
+  gpuCompute.setVariableDependencies(velocityVariable, [positionVariable, velocityVariable, visualVariable]);
+  gpuCompute.setVariableDependencies(positionVariable, [positionVariable, velocityVariable, visualVariable]);
+  gpuCompute.setVariableDependencies(visualVariable, [positionVariable, velocityVariable, visualVariable]);
+
+  const allVariables = [velocityVariable, positionVariable, visualVariable];
+
+  for (const variable of allVariables) {
+    const uniforms = variable.material.uniforms;
+    uniforms.uParticleBaseTexture = { value: baseTexture };
+    uniforms.uFluidTexture = { value: syncParticleFluidTexture() };
+    uniforms.uParticleCount = { value: count };
+    uniforms.uTime = { value: 0 };
+    uniforms.uDeltaTime = { value: 0.016 };
+    uniforms.uFrameScale = { value: 1 };
+    uniforms.uEffectiveFriction = { value: getEffectiveFriction() };
+    uniforms.uActivityGain = { value: motionTuning.activityGain };
+    uniforms.uPointerActive = { value: 0 };
+    uniforms.uPointerEnergy = { value: 0 };
+    uniforms.uHitRadius = { value: 0 };
+    uniforms.uPointerPosition = { value: new THREE.Vector3() };
+    uniforms.uOuterBounds = { value: new THREE.Vector3() };
+    uniforms.uViewportBounds = { value: new THREE.Vector2() };
+  }
+  const error = gpuCompute.init();
+  if (error) {
+    throw new Error(typeof error === "string" ? error : "GPU particle init failed");
+  }
+
+  function updateSimulationUniforms(dt, frameScale, time, pointerPosition, pointerEnergy, pointerActive, hitRadius) {
+    const outerBounds = getParticleSoftBounds(tmpV4);
+
+    for (const variable of allVariables) {
+      const uniforms = variable.material.uniforms;
+      uniforms.uFluidTexture.value = syncParticleFluidTexture();
+      uniforms.uTime.value = time;
+      uniforms.uDeltaTime.value = dt;
+      uniforms.uFrameScale.value = frameScale;
+      uniforms.uEffectiveFriction.value = getEffectiveFriction();
+      uniforms.uActivityGain.value = motionTuning.activityGain;
+      uniforms.uPointerActive.value = pointerActive ? 1 : 0;
+      uniforms.uPointerEnergy.value = pointerEnergy;
+      uniforms.uHitRadius.value = hitRadius;
+      uniforms.uPointerPosition.value.copy(pointerPosition);
+      uniforms.uOuterBounds.value.copy(outerBounds);
+      uniforms.uViewportBounds.value.copy(viewportBounds);
+    }
+
+    if (particleMaterial) {
+      particleMaterial.uniforms.uPositionTexture.value = gpuCompute.getCurrentRenderTarget(positionVariable).texture;
+      particleMaterial.uniforms.uVelocityTexture.value = gpuCompute.getCurrentRenderTarget(velocityVariable).texture;
+      particleMaterial.uniforms.uVisualTexture.value = gpuCompute.getCurrentRenderTarget(visualVariable).texture;
+      particleMaterial.uniforms.uBaseTexture.value = baseTexture;
+    }
+
+  }
+
+  return {
+    width,
+    height,
+    step(dt, frameScale, time, pointerPosition, pointerEnergy, pointerActive, hitRadius) {
+      updateSimulationUniforms(dt, frameScale, time, pointerPosition, pointerEnergy, pointerActive, hitRadius);
+      gpuCompute.compute();
+      if (particleMaterial) {
+        particleMaterial.uniforms.uPositionTexture.value = gpuCompute.getCurrentRenderTarget(positionVariable).texture;
+        particleMaterial.uniforms.uVelocityTexture.value = gpuCompute.getCurrentRenderTarget(velocityVariable).texture;
+        particleMaterial.uniforms.uVisualTexture.value = gpuCompute.getCurrentRenderTarget(visualVariable).texture;
+      }
+    },
+    getPositionTexture() {
+      return gpuCompute.getCurrentRenderTarget(positionVariable).texture;
+    },
+    getVelocityTexture() {
+      return gpuCompute.getCurrentRenderTarget(velocityVariable).texture;
+    },
+    getVisualTexture() {
+      return gpuCompute.getCurrentRenderTarget(visualVariable).texture;
+    },
+    getBaseTexture() {
+      return baseTexture;
+    },
+    dispose() {
+      gpuCompute.dispose();
+    }
+  };
 }
 
 function computeParticleCount(width, height) {
@@ -925,13 +1772,17 @@ function buildText(font) {
   box.getSize(logoBounds);
   backgroundHalo.scale.set(logoBounds.x * 1.5, logoBounds.y * 1.25, 1);
   particleField.set(
-    logoBounds.x * 0.9,
-    logoBounds.y * 1.8,
-    Math.max(logoBounds.z * 2.4, 150)
+    logoBounds.x * 0.9 * OUTER_SHELL_SCALE_XY,
+    logoBounds.y * 1.8 * OUTER_SHELL_SCALE_XY,
+    Math.max(logoBounds.z * 2.4, 150) * OUTER_SHELL_SCALE_Z
   );
 }
 
 function disposeParticles() {
+  if (gpuParticleController) {
+    gpuParticleController.dispose();
+    gpuParticleController = null;
+  }
   if (particleSystem) {
     logoRig.remove(particleSystem);
     particleSystem.geometry.dispose();
@@ -942,59 +1793,168 @@ function disposeParticles() {
     particleMaterial = null;
   }
   positionAttr = null;
-  colorAttr = null;
   sizeVarianceAttr = null;
+  particleReferenceAttr = null;
   particleCount = 0;
   particleTargetCount = 0;
 }
 
 function ensureParticleMaterial() {
   if (particleMaterial) return;
-  particleMaterial = new THREE.PointsMaterial({
-    map: particleSprite,
-    color: 0xffffff,
+  particleMaterial = new THREE.ShaderMaterial({
     transparent: true,
-    opacity: 0.76,
-    alphaTest: 0.06,
     blending: THREE.AdditiveBlending,
     depthWrite: false,
-    sizeAttenuation: true,
-    vertexColors: true,
-    size: getBaseParticleSize()
+    depthTest: true,
+    uniforms: {
+      uPositionTexture: { value: null },
+      uVelocityTexture: { value: null },
+      uVisualTexture: { value: null },
+      uBaseTexture: { value: null },
+      uParticleMap: { value: particleSprite },
+      uParticleSizeScale: { value: motionTuning.particleSize },
+      uParticleSizeRandomness: { value: motionTuning.particleSizeRandomness },
+      uParticlePulseTime: { value: pulseTime },
+      uViewportScale: { value: 1 },
+      uParticleDensitySize: { value: 1 },
+      uParticleDensityAlpha: { value: 1 },
+      uParticleDensityGlow: { value: 1 },
+      uParticleDensityWhite: { value: 1 },
+      uLetterColors: { value: Array.from({ length: LETTER_COUNT }, () => new THREE.Color().copy(TEAL)) }
+    },
+    vertexShader: `
+      uniform sampler2D uPositionTexture;
+      uniform sampler2D uVelocityTexture;
+      uniform sampler2D uVisualTexture;
+      uniform sampler2D uBaseTexture;
+      uniform float uParticleSizeScale;
+      uniform float uParticleSizeRandomness;
+      uniform float uParticlePulseTime;
+      uniform float uViewportScale;
+      uniform float uParticleDensitySize;
+      uniform float uParticleDensityGlow;
+      uniform float uParticleDensityWhite;
+      uniform vec3 uLetterColors[${LETTER_COUNT}];
+
+      attribute vec2 aParticleUv;
+      attribute float aSizeVariance;
+
+      varying vec3 vParticleColor;
+
+      ${makeLetterColorLookupGLSL("uLetterColors")}
+
+      void main() {
+        vec4 positionData = texture2D(uPositionTexture, aParticleUv);
+        vec4 velocityData = texture2D(uVelocityTexture, aParticleUv);
+        vec4 visualData = texture2D(uVisualTexture, aParticleUv);
+        vec4 baseData = texture2D(uBaseTexture, aParticleUv);
+
+        float speed = length(velocityData.xyz);
+        float colorMix = visualData.x;
+        float wake = visualData.y;
+        float emissionMix = clamp(visualData.z / ${PARTICLE_INTENSITY_MAX.toFixed(6)}, 0.0, 1.0);
+        float assignedLetter = visualData.w;
+        float glowTarget = ${PARTICLE_GLOW_BASE.toFixed(6)} +
+          wake * ${PARTICLE_GLOW_WAKE.toFixed(6)} +
+          clamp(speed * ${PARTICLE_GLOW_SPEED.toFixed(6)}, 0.0, 0.38);
+        float normalSpeedGlow = clamp(0.44 + speed * 0.026, 0.44, 0.52);
+        float flashSpeedGlow = clamp(1.1 + speed * 0.16, 1.1, 1.34);
+        float glowCompression = mix(
+          1.0,
+          uParticleDensityGlow,
+          clamp(emissionMix * 1.35 + wake * 0.35, 0.0, 1.0)
+        );
+        float speedGlow = mix(normalSpeedGlow, flashSpeedGlow, emissionMix) * glowCompression;
+        float normalWhiteMix = clamp(0.008 + speed * 0.003, 0.008, 0.016);
+        float flashWhiteMix = clamp(speed * 0.004, 0.0, 0.012);
+        float whiteCompression = mix(
+          1.0,
+          uParticleDensityWhite,
+          clamp(emissionMix * 1.55 + wake * 0.25, 0.0, 1.0)
+        );
+        float whiteMix = mix(normalWhiteMix, flashWhiteMix, emissionMix) * whiteCompression * 0.16;
+        float inheritedMix = colorMix * step(-0.5, assignedLetter);
+        vec3 inheritedColor = sampleLetterColor(max(assignedLetter, 0.0));
+        vec3 baseColor = mix(vec3(${TEAL.r.toFixed(6)}, ${TEAL.g.toFixed(6)}, ${TEAL.b.toFixed(6)}), inheritedColor, inheritedMix);
+        float glowBoost = clamp(
+          1.0 + emissionMix * (${PARTICLE_GLOW_BOOST_MAX.toFixed(6)} - 1.0) * glowCompression * 0.48,
+          1.0,
+          ${PARTICLE_GLOW_BOOST_MAX.toFixed(6)}
+        );
+        float pulse = 1.0 + sin(uParticlePulseTime * 8.0 + baseData.x * 9.0) * (0.02 + emissionMix * 0.03);
+        float glowEnergy = glowTarget * speedGlow * glowBoost * pulse;
+        float basePeak = max(max(baseColor.r, baseColor.g), max(baseColor.b, 0.0001));
+        float glowCeiling = max(${PARTICLE_COLOR_CHANNEL_MAX.toFixed(6)} - whiteMix, 0.0);
+        float huePreservingEnergy = min(glowEnergy, glowCeiling / basePeak);
+        vParticleColor = clamp(baseColor * huePreservingEnergy + whiteMix, 0.0, ${PARTICLE_COLOR_CHANNEL_MAX.toFixed(6)});
+
+        vec4 mvPosition = modelViewMatrix * vec4(positionData.xyz, 1.0);
+        gl_Position = projectionMatrix * mvPosition;
+
+        float sizeJitter = (aSizeVariance * 2.0 - 1.0) * uParticleSizeRandomness;
+        gl_PointSize = uParticleSizeScale * max(0.22, 1.0 + sizeJitter);
+        gl_PointSize *= uParticleDensitySize;
+        gl_PointSize *= uViewportScale / max(-mvPosition.z, 0.0001);
+      }
+    `,
+    fragmentShader: `
+      uniform sampler2D uParticleMap;
+      uniform float uParticleDensityAlpha;
+      varying vec3 vParticleColor;
+
+      void main() {
+        vec2 spriteUv = gl_PointCoord * 2.0 - 1.0;
+        float spriteRadius = length(spriteUv);
+        if (spriteRadius > 1.0) discard;
+
+        vec4 sprite = texture2D(uParticleMap, gl_PointCoord);
+        float radialMask = 1.0 - smoothstep(0.76, 1.0, spriteRadius);
+        vec4 color = vec4(vParticleColor, 1.0);
+        color.rgb *= sprite.rgb * radialMask;
+        color.a = sprite.a * radialMask * uParticleDensityAlpha;
+        if (color.a < 0.035) discard;
+        gl_FragColor = color;
+      }
+    `
   });
-  particleMaterial.customProgramCacheKey = () => "hanelab-particle-size-v1";
-  particleMaterial.onBeforeCompile = (shader) => {
-    shader.uniforms.uParticleSizeScale = { value: motionTuning.particleSize };
-    shader.uniforms.uParticleSizeRandomness = { value: motionTuning.particleSizeRandomness };
-    particleMaterial.userData.sizeUniforms = {
-      uParticleSizeScale: shader.uniforms.uParticleSizeScale,
-      uParticleSizeRandomness: shader.uniforms.uParticleSizeRandomness
-    };
-    shader.vertexShader = shader.vertexShader
-      .replace(
-        "#include <common>",
-        "#include <common>\nattribute float aSizeVariance;\nuniform float uParticleSizeScale;\nuniform float uParticleSizeRandomness;"
-      )
-      .replace(
-        "gl_PointSize = size;",
-        "float sizeJitter = (aSizeVariance * 2.0 - 1.0) * uParticleSizeRandomness;\n\tgl_PointSize = size * uParticleSizeScale * max(0.22, 1.0 + sizeJitter);"
-      );
+  particleMaterial.userData.sizeUniforms = {
+    uParticleSizeScale: particleMaterial.uniforms.uParticleSizeScale,
+    uParticleSizeRandomness: particleMaterial.uniforms.uParticleSizeRandomness,
+    uParticlePulseTime: particleMaterial.uniforms.uParticlePulseTime,
+    uViewportScale: particleMaterial.uniforms.uViewportScale,
+    uParticleDensitySize: particleMaterial.uniforms.uParticleDensitySize,
+    uParticleDensityAlpha: particleMaterial.uniforms.uParticleDensityAlpha,
+    uParticleDensityGlow: particleMaterial.uniforms.uParticleDensityGlow,
+    uParticleDensityWhite: particleMaterial.uniforms.uParticleDensityWhite
   };
   particleMaterial.toneMapped = false;
   updateParticleMaterialTuning();
-  particleMaterial.depthTest = true;
 }
 
 function rebuildParticleGeometry() {
   const geometry = new THREE.BufferGeometry();
-  positionAttr = new THREE.BufferAttribute(particlePositions, 3);
-  colorAttr = new THREE.BufferAttribute(particleColors, 3);
+  positionAttr = new THREE.BufferAttribute(new Float32Array(particleCount * 3), 3);
+  const referenceUvs = new Float32Array(particleCount * 2);
   sizeVarianceAttr = new THREE.BufferAttribute(particleSizeVariance, 1);
-  positionAttr.setUsage(THREE.DynamicDrawUsage);
-  colorAttr.setUsage(THREE.DynamicDrawUsage);
+
+  if (!gpuParticleController) {
+    throw new Error("Missing GPU particle controller");
+  }
+
+  for (let i = 0; i < particleCount; i++) {
+    const o = i * 2;
+    const x = (i % gpuParticleController.width) + 0.5;
+    const y = Math.floor(i / gpuParticleController.width) + 0.5;
+    referenceUvs[o] = x / gpuParticleController.width;
+    referenceUvs[o + 1] = y / gpuParticleController.height;
+  }
+
+  particleReferenceAttr = new THREE.BufferAttribute(referenceUvs, 2);
+  positionAttr.setUsage(THREE.StaticDrawUsage);
+  particleReferenceAttr.setUsage(THREE.StaticDrawUsage);
   sizeVarianceAttr.setUsage(THREE.StaticDrawUsage);
   geometry.setAttribute("position", positionAttr);
-  geometry.setAttribute("color", colorAttr);
+  geometry.setAttribute("aParticleUv", particleReferenceAttr);
   geometry.setAttribute("aSizeVariance", sizeVarianceAttr);
 
   if (particleSystem) {
@@ -1009,7 +1969,7 @@ function rebuildParticleGeometry() {
   logoRig.add(particleSystem);
 }
 
-function spawnParticleAt(index, sampler, shellRadius, fieldX, fieldY, fieldZ) {
+function spawnParticleAt(index) {
   const o = index * 3;
   particleSeeds[index] = Math.random() * Math.PI * 2;
   particleTurbulence[index] = 0.75 + Math.random() * 1.1;
@@ -1021,36 +1981,31 @@ function spawnParticleAt(index, sampler, shellRadius, fieldX, fieldY, fieldZ) {
   particleAssignedIntensity[index] = 0;
   particleAssignedLetter[index] = -1;
   particleSpin[index] = Math.random() < 0.5 ? -1 : 1;
-  particleAssignedColors[o] = -1;
-  particleAssignedColors[o + 1] = -1;
-  particleAssignedColors[o + 2] = -1;
+  clearParticleAssignedColor(index);
+  setParticleVisualState(index, 0, 0, 0, 0);
 
-  sampler.sample(tmpV1, tmpV2);
-  tmpV2.normalize();
+  const shellBounds = getParticleHardBounds(tmpV4);
+  const shellBoundX = shellBounds.x * 0.985;
+  const shellBoundY = shellBounds.y * 0.985;
+  const shellBoundZ = shellBounds.z * 0.985;
+  const shellSizeX = shellBoundX * 2;
+  const shellSizeY = shellBoundY * 2;
+  const shellSizeZ = shellBoundZ * 2;
+  const shellVolume = Math.max(shellSizeX * shellSizeY * shellSizeZ, 1);
+  const gridScale = Math.cbrt(Math.max(particleCount, 1) / shellVolume);
+  const cellsX = Math.max(1, Math.ceil(shellSizeX * gridScale));
+  const cellsY = Math.max(1, Math.ceil(shellSizeY * gridScale));
+  const cellsZ = Math.max(1, Math.ceil(shellSizeZ * gridScale));
+  const cellsPerLayer = cellsX * cellsY;
+  const cellX = index % cellsX;
+  const cellY = Math.floor(index / cellsX) % cellsY;
+  const cellZ = Math.floor(index / cellsPerLayer) % cellsZ;
 
-  const spreadX = Math.max(viewportBounds.x * 2.1, fieldX * 1.25);
-  const spreadY = Math.max(viewportBounds.y * 2.1, fieldY * 1.2);
-
-  if (Math.random() < 0.26) {
-    tmpV3.set(hash(index + 19) - 0.5, hash(index + 41) - 0.5, hash(index + 83) - 0.5).normalize();
-    tmpV3.crossVectors(tmpV3, tmpV2).normalize();
-    tmpV4.crossVectors(tmpV2, tmpV3).normalize();
-
-    const lift = shellRadius + Math.random() * 48;
-    const tangentJitter = randomSpread(48);
-    const bitangentJitter = randomSpread(48);
-
-    tmpV1
-      .addScaledVector(tmpV2, lift)
-      .addScaledVector(tmpV3, tangentJitter)
-      .addScaledVector(tmpV4, bitangentJitter);
-  } else {
-    tmpV1.set(
-      randomSpread(spreadX),
-      randomSpread(spreadY),
-      randomSpread(fieldZ * 0.85)
-    );
-  }
+  tmpV1.set(
+    -shellBoundX + ((cellX + hash(index * 1.13 + 17.0)) / cellsX) * shellSizeX,
+    -shellBoundY + ((cellY + hash(index * 1.37 + 29.0)) / cellsY) * shellSizeY,
+    -shellBoundZ + ((cellZ + hash(index * 1.61 + 43.0)) / cellsZ) * shellSizeZ
+  );
 
   particlePositions[o] = tmpV1.x;
   particlePositions[o + 1] = tmpV1.y;
@@ -1059,11 +2014,6 @@ function spawnParticleAt(index, sampler, shellRadius, fieldX, fieldY, fieldZ) {
   particleVelocities[o] = 0;
   particleVelocities[o + 1] = 0;
   particleVelocities[o + 2] = 0;
-
-  const whiteMix = 0.08 + Math.random() * 0.14;
-  particleColors[o] = TEAL.r * (1 - whiteMix) + whiteMix;
-  particleColors[o + 1] = TEAL.g * (1 - whiteMix) + whiteMix;
-  particleColors[o + 2] = TEAL.b * (1 - whiteMix) + whiteMix;
 }
 
 function resetParticleInteractionState(count, resetVelocity = false) {
@@ -1076,9 +2026,8 @@ function resetParticleInteractionState(count, resetVelocity = false) {
     particleHitCooldown[i] = 0;
     particleAssignedIntensity[i] = 0;
     particleAssignedLetter[i] = -1;
-    particleAssignedColors[o] = -1;
-    particleAssignedColors[o + 1] = -1;
-    particleAssignedColors[o + 2] = -1;
+    clearParticleAssignedColor(i);
+    setParticleVisualState(i, 0, 0, 0, 0);
 
     if (resetVelocity) {
       particleVelocities[o] = 0;
@@ -1098,7 +2047,6 @@ function buildParticles(count) {
   particleTargetCount = count;
   particlePositions = new Float32Array(count * 3);
   particleVelocities = new Float32Array(count * 3);
-  particleColors = new Float32Array(count * 3);
   particleSeeds = new Float32Array(count);
   particleTurbulence = new Float32Array(count);
   particleMass = new Float32Array(count);
@@ -1106,24 +2054,23 @@ function buildParticles(count) {
   particleWake = new Float32Array(count);
   particleHitCooldown = new Float32Array(count);
   particleSizeVariance = new Float32Array(count);
-  particleAssignedColors = new Float32Array(count * 3);
+  particleVisualState = new Uint8Array(count * 4);
+  particleAssignedColorBytes = new Uint8Array(count * 3);
   particleAssignedIntensity = new Float32Array(count);
   particleAssignedLetter = new Int16Array(count);
   particleSpin = new Float32Array(count);
 
   ensureParticleMaterial();
 
-  const sampler = new MeshSurfaceSampler(textMesh).build();
-  const bounds = textGeometry.boundingBox?.getSize(new THREE.Vector3()) || new THREE.Vector3(600, 140, 40);
-  const shellRadius = Math.max(bounds.x * 0.11, 28);
-  const fieldX = particleField.x;
-  const fieldY = particleField.y;
-  const fieldZ = particleField.z;
-
   for (let i = 0; i < count; i++) {
-    spawnParticleAt(i, sampler, shellRadius, fieldX, fieldY, fieldZ);
+    spawnParticleAt(i);
   }
 
+  gpuParticleController = createGpuParticleController(count);
+  particleMaterial.uniforms.uPositionTexture.value = gpuParticleController.getPositionTexture();
+  particleMaterial.uniforms.uVelocityTexture.value = gpuParticleController.getVelocityTexture();
+  particleMaterial.uniforms.uVisualTexture.value = gpuParticleController.getVisualTexture();
+  particleMaterial.uniforms.uBaseTexture.value = gpuParticleController.getBaseTexture();
   rebuildParticleGeometry();
 }
 
@@ -1131,73 +2078,7 @@ function resizeParticleSystem(nextCount) {
   if (!textGeometry || !textMesh) return;
   const targetCount = normalizeParticleCount(nextCount);
   if (targetCount === particleCount) return;
-  if (!particleSystem || particleCount === 0) {
-    buildParticles(targetCount);
-    return;
-  }
-
-  const copyCount = Math.min(particleCount, targetCount);
-  const nextPositions = new Float32Array(targetCount * 3);
-  const nextVelocities = new Float32Array(targetCount * 3);
-  const nextColors = new Float32Array(targetCount * 3);
-  const nextSeeds = new Float32Array(targetCount);
-  const nextTurbulence = new Float32Array(targetCount);
-  const nextMass = new Float32Array(targetCount);
-  const nextColorMix = new Float32Array(targetCount);
-  const nextWake = new Float32Array(targetCount);
-  const nextHitCooldown = new Float32Array(targetCount);
-  const nextSizeVariance = new Float32Array(targetCount);
-  const nextAssignedColors = new Float32Array(targetCount * 3);
-  const nextAssignedIntensity = new Float32Array(targetCount);
-  const nextAssignedLetter = new Int16Array(targetCount);
-  const nextSpin = new Float32Array(targetCount);
-
-  nextPositions.set(particlePositions.subarray(0, copyCount * 3));
-  nextVelocities.set(particleVelocities.subarray(0, copyCount * 3));
-  nextColors.set(particleColors.subarray(0, copyCount * 3));
-  nextSeeds.set(particleSeeds.subarray(0, copyCount));
-  nextTurbulence.set(particleTurbulence.subarray(0, copyCount));
-  nextMass.set(particleMass.subarray(0, copyCount));
-  nextColorMix.set(particleColorMix.subarray(0, copyCount));
-  nextWake.set(particleWake.subarray(0, copyCount));
-  nextHitCooldown.set(particleHitCooldown.subarray(0, copyCount));
-  nextSizeVariance.set(particleSizeVariance.subarray(0, copyCount));
-  nextAssignedColors.set(particleAssignedColors.subarray(0, copyCount * 3));
-  nextAssignedIntensity.set(particleAssignedIntensity.subarray(0, copyCount));
-  nextAssignedLetter.set(particleAssignedLetter.subarray(0, copyCount));
-  nextSpin.set(particleSpin.subarray(0, copyCount));
-
-  particlePositions = nextPositions;
-  particleVelocities = nextVelocities;
-  particleColors = nextColors;
-  particleSeeds = nextSeeds;
-  particleTurbulence = nextTurbulence;
-  particleMass = nextMass;
-  particleColorMix = nextColorMix;
-  particleWake = nextWake;
-  particleHitCooldown = nextHitCooldown;
-  particleSizeVariance = nextSizeVariance;
-  particleAssignedColors = nextAssignedColors;
-  particleAssignedIntensity = nextAssignedIntensity;
-  particleAssignedLetter = nextAssignedLetter;
-  particleSpin = nextSpin;
-
-  if (targetCount > copyCount) {
-    const sampler = new MeshSurfaceSampler(textMesh).build();
-    const bounds = textGeometry.boundingBox?.getSize(new THREE.Vector3()) || new THREE.Vector3(600, 140, 40);
-    const shellRadius = Math.max(bounds.x * 0.11, 28);
-    const fieldX = particleField.x;
-    const fieldY = particleField.y;
-    const fieldZ = particleField.z;
-
-    for (let i = copyCount; i < targetCount; i++) {
-      spawnParticleAt(i, sampler, shellRadius, fieldX, fieldY, fieldZ);
-    }
-  }
-
-  resetParticleInteractionState(targetCount, true);
-  particleCount = targetCount;
-  rebuildParticleGeometry();
+  buildParticles(targetCount);
 }
 
 function sampleFluidArrays(gridX, gridY, fieldX, fieldY, target) {
@@ -1261,6 +2142,10 @@ function getFluidImpulseThickness() {
 function createGPUFluidController() {
   const gpuComposer = GPUComposer.initWithThreeRenderer(renderer);
   gpuComposer.undoThreeState();
+  const supportsAsyncReadback = gpuComposer.isWebGL2 && typeof GPULayer.prototype.getValuesAsync === "function";
+  let readbackPromise = null;
+  let readbackFrameCounter = 0;
+  let readbackGeneration = 0;
 
   const velocityState = new GPULayer(gpuComposer, {
     name: "velocity",
@@ -1419,13 +2304,11 @@ function createGPUFluidController() {
 
   function updateDimensions() {
     const { width, height } = getFluidCanvasMetrics();
-    const effectiveFriction = getEffectiveFriction();
     advection.setUniform("u_dimensions", [width, height]);
-    advection.setUniform("u_decay", Math.max(0.9, 0.988 - effectiveFriction * 0.03));
+    advection.setUniform("u_decay", getEffectiveFluidDecay());
   }
 
-  function syncReadback() {
-    const values = velocityState.getValues();
+  function applyReadback(values) {
     const { width, height } = getFluidCanvasMetrics();
     const scaleX = (viewportBounds.x * 2) / width * FLUID_SAMPLE_SCALE;
     const scaleY = (viewportBounds.y * 2) / height * FLUID_SAMPLE_SCALE;
@@ -1435,6 +2318,41 @@ function createGPUFluidController() {
       fluidVelocityX[i] = values[offset] * scaleX;
       fluidVelocityY[i] = values[offset + 1] * scaleY;
     }
+    markParticleFluidTextureDirty();
+  }
+
+  function requestReadback(force = false) {
+    if (readbackPromise) return;
+
+    const interval = particleCount >= 90000 ? 3 : particleCount >= 60000 ? 2 : 1;
+    if (!force) {
+      readbackFrameCounter += 1;
+      if (readbackFrameCounter < interval) {
+        return;
+      }
+    }
+    readbackFrameCounter = 0;
+
+    if (supportsAsyncReadback) {
+      const generation = readbackGeneration;
+      readbackPromise = velocityState.getValuesAsync()
+        .then((values) => {
+          if (generation !== readbackGeneration) return;
+          applyReadback(values);
+        })
+        .catch(() => {
+          if (generation !== readbackGeneration) return;
+          applyReadback(velocityState.getValues());
+        })
+        .finally(() => {
+          if (generation === readbackGeneration) {
+            readbackPromise = null;
+          }
+        });
+      return;
+    }
+
+    applyReadback(velocityState.getValues());
   }
 
   function clear() {
@@ -1442,14 +2360,19 @@ function createGPUFluidController() {
     velocityState.clear(true);
     divergenceState.clear();
     pressureState.clear(true);
+    readbackGeneration += 1;
+    readbackPromise = null;
+    readbackFrameCounter = 0;
     fluidVelocityX.fill(0);
     fluidVelocityY.fill(0);
+    markParticleFluidTextureDirty();
     gpuComposer.resetThreeState();
   }
 
   function step() {
     gpuComposer.undoThreeState();
     updateDimensions();
+    const hadPendingImpulses = pendingFluidImpulses.length > 0;
 
     while (pendingFluidImpulses.length > 0) {
       const impulse = pendingFluidImpulses.shift();
@@ -1492,7 +2415,7 @@ function createGPUFluidController() {
       output: velocityState
     });
 
-    syncReadback();
+    requestReadback(hadPendingImpulses);
     gpuComposer.resetThreeState();
   }
 
@@ -1527,6 +2450,7 @@ function clearFluidField() {
   }
   fluidVelocityX.fill(0);
   fluidVelocityY.fill(0);
+  markParticleFluidTextureDirty();
 }
 
 function queueFluidImpulse(position1, position2) {
@@ -1600,17 +2524,33 @@ function updateViewport() {
   bloomPass.radius = isMobileLayout ? 0.36 : 0.44;
   bloomPass.threshold = isMobileLayout ? 0.12 : 0.08;
 
+  pointerViewport.left = 0;
+  pointerViewport.top = 0;
+  pointerViewport.width = width;
+  pointerViewport.height = height;
+  pointerViewport.centerOffsetX = 0;
+
+  if (!isMobileLayout && tuningPanel) {
+    const panelRect = tuningPanel.getBoundingClientRect();
+    const panelLeft = clamp(panelRect.left - rect.left - 24, width * 0.62, width);
+    pointerViewport.width = Math.max(panelLeft, 1);
+    pointerViewport.centerOffsetX = pointerViewport.left + pointerViewport.width * 0.5 - width * 0.5;
+  }
+
   if (textReady) {
     const distance = camera.position.z;
     const visibleHeight = 2 * Math.tan(THREE.MathUtils.degToRad(camera.fov * 0.5)) * distance;
     const visibleWidth = visibleHeight * camera.aspect;
-    const targetWidth = visibleWidth * (isMobileLayout ? 0.82 : 0.67);
+    const usableWidthRatio = clamp(pointerViewport.width / Math.max(width, 1), isMobileLayout ? 1 : 0.62, 1);
+    const targetWidth = visibleWidth * usableWidthRatio * (isMobileLayout ? 0.82 : 0.69);
     const targetHeight = visibleHeight * (isMobileLayout ? 0.23 : 0.21);
     const scale = Math.min(
       targetWidth / Math.max(logoBounds.x, 1),
       targetHeight / Math.max(logoBounds.y, 1)
     );
     logoRig.scale.setScalar(scale);
+    logoRig.position.x = (pointerViewport.centerOffsetX / Math.max(width, 1)) * visibleWidth;
+    rimLight.position.x = logoRig.position.x;
     viewportBounds.set(
       (visibleWidth * 0.5) / Math.max(scale, 0.0001) * 0.96,
       (visibleHeight * 0.5) / Math.max(scale, 0.0001) * 0.92
@@ -1682,215 +2622,54 @@ function animate() {
   }
 
   const pointerEnergy = clamp(pointer.speed * 0.075, 0, 8.5);
-  const boundX = viewportBounds.x;
-  const boundY = viewportBounds.y;
-  const boundZ = particleField.z;
+  const shellBounds = getParticleSoftBounds(tmpV2);
+  const boundX = shellBounds.x;
+  const boundY = shellBounds.y;
+  const boundZ = shellBounds.z;
   const hitRadius = getMaxCursorRadius() * motionTuning.radius;
   const hitRadiusSq = hitRadius * hitRadius;
-  const pointerLocalX = clamp(pointer.local.x, -Math.max(boundX - hitRadius, 0), Math.max(boundX - hitRadius, 0));
-  const pointerLocalY = clamp(pointer.local.y, -Math.max(boundY - hitRadius, 0), Math.max(boundY - hitRadius, 0));
-  const pointerLocalZ = clamp(pointer.local.z, -Math.max(boundZ - hitRadius, 0), Math.max(boundZ - hitRadius, 0));
+  const pointerLocalX = clamp(
+    pointer.local.x,
+    -Math.max(viewportBounds.x - hitRadius, 0),
+    Math.max(viewportBounds.x - hitRadius, 0)
+  );
+  const pointerLocalY = clamp(
+    pointer.local.y,
+    -Math.max(viewportBounds.y - hitRadius, 0),
+    Math.max(viewportBounds.y - hitRadius, 0)
+  );
+  const pointerLocalZ = clamp(
+    pointer.local.z,
+    -Math.max(boundZ - hitRadius, 0),
+    Math.max(boundZ - hitRadius, 0)
+  );
 
-  cursorSphere.visible = pointer.active && pointer.ready && hitRadius > 0.001;
-  if (cursorSphere.visible) {
-    cursorSphere.position.set(pointerLocalX, pointerLocalY, pointerLocalZ);
-    cursorSphere.scale.setScalar(hitRadius);
-  }
+  cursorSphere.visible = motionTuning.showCursor !== false && pointer.active && pointer.ready && hitRadius > 0.001;
 
   stepFluidField();
 
-  if (particleSystem && positionAttr && colorAttr) {
-    for (let i = 0; i < particleCount; i++) {
-      const o = i * 3;
-      const seed = particleSeeds[i];
-      const turbulence = particleTurbulence[i];
-      const mass = particleMass[i];
-      particleHitCooldown[i] = Math.max(0, particleHitCooldown[i] - dt);
+  const particleUniforms = particleMaterial?.userData.sizeUniforms;
+  if (particleUniforms?.uParticlePulseTime) {
+    particleUniforms.uParticlePulseTime.value = pulseTime;
+  }
 
-      const px = particlePositions[o];
-      const py = particlePositions[o + 1];
-      const pz = particlePositions[o + 2];
-
-      let vx = particleVelocities[o];
-      let vy = particleVelocities[o + 1];
-      let vz = particleVelocities[o + 2];
-
-      const sampleOffsetX =
-        Math.sin(seed * 11.7 + pz * 0.006 + t * 0.14) * 4.8 +
-        Math.sin(seed * 23.1 - py * 0.012 - t * 0.48) * 2.2;
-      const sampleOffsetY =
-        Math.cos(seed * 13.1 + pz * 0.005 - t * 0.11) * 4.8 +
-        Math.cos(seed * 19.7 + px * 0.014 + t * 0.41) * 2.2;
-      sampleFluidVelocity(px + sampleOffsetX, py + sampleOffsetY, tmpFlowA);
-      sampleFluidVelocity(px - sampleOffsetY * 0.45, py + sampleOffsetX * 0.45, tmpFlowB);
-      tmpFlowA.lerp(tmpFlowB, 0.35);
-      const hitInfluence = Math.max(particleColorMix[i], clamp(particleWake[i], 0, 1));
-      const fluidCoupling = (
-        FLUID_COUPLING_BASE +
-        hitInfluence * FLUID_COUPLING_WAKE
-      ) * frame / mass;
-      const fluidRelax = clamp(
-        (
-          FLUID_RELAX_BASE +
-          hitInfluence * FLUID_RELAX_WAKE
-        ) * frame / mass,
-        0,
-        0.12
-      );
-      vx += tmpFlowA.x * fluidCoupling;
-      vy += tmpFlowA.y * fluidCoupling;
-      vx += (tmpFlowA.x - vx) * fluidRelax;
-      vy += (tmpFlowA.y - vy) * fluidRelax;
-
-      if (pointer.active && pointer.ready && pointerEnergy > 0.0001 && hitRadius > 0.001) {
-        const hitX = px - pointerLocalX;
-        const hitY = py - pointerLocalY;
-        const hitZ = pz - pointerLocalZ;
-        const hitDistSq = hitX * hitX + hitY * hitY + hitZ * hitZ;
-
-        if (hitDistSq < hitRadiusSq) {
-          const dist = Math.sqrt(hitDistSq) || 1;
-          const falloff = Math.pow(1 - hitDistSq / hitRadiusSq, 2);
-          const nx = hitX / dist;
-          const ny = hitY / dist;
-          const nz = hitZ / dist;
-          const depthLift = pointerEnergy * falloff * 0.16 * frame;
-
-          vx += nx * depthLift * 0.14;
-          vy += ny * depthLift * 0.14;
-          vz += nz * depthLift * 0.18 + (hash(i + 97) - 0.5) * depthLift * 0.08;
-          particleColorMix[i] = 1;
-          particleWake[i] = Math.max(particleWake[i], 1);
-
-          if (particleAssignedLetter[i] < 0) {
-            const randomLetterIndex = Math.floor(Math.random() * letterEntries.length);
-            const hitColor = letterEntries[randomLetterIndex].glow.material.color;
-            particleAssignedLetter[i] = randomLetterIndex;
-            particleAssignedColors[o] = hitColor.r;
-            particleAssignedColors[o + 1] = hitColor.g;
-            particleAssignedColors[o + 2] = hitColor.b;
-          }
-
-          if (particleHitCooldown[i] <= 0) {
-            particleHitCooldown[i] = PARTICLE_HIT_COOLDOWN;
-            particleAssignedIntensity[i] = Math.max(
-              particleAssignedIntensity[i],
-              PARTICLE_HIT_FLASH + falloff * PARTICLE_HIT_FLASH_EXTRA + pointerEnergy * 0.12
-            );
-            particleAssignedIntensity[i] = Math.min(particleAssignedIntensity[i], PARTICLE_INTENSITY_MAX);
-          }
-        }
-      }
-
-      tmpV1.set(vx, vy, vz);
-      applyEdgeCornerRepulsion(px, py, pz, tmpV1, boundX, boundY, boundZ, seed, t, frame);
-      vx = tmpV1.x;
-      vy = tmpV1.y;
-      vz = tmpV1.z;
-      if (px < -boundX || px > boundX) {
-        vx += (px < -boundX ? -boundX - px : boundX - px) * 0.09 * frame;
-        vx *= 0.82;
-      }
-      if (py < -boundY || py > boundY) {
-        vy += (py < -boundY ? -boundY - py : boundY - py) * 0.09 * frame;
-        vy *= 0.82;
-      }
-      if (pz < -boundZ || pz > boundZ) {
-        vz += (pz < -boundZ ? -boundZ - pz : boundZ - pz) * 0.035 * frame;
-        vz *= 0.84;
-      }
-
-      particleWake[i] *= 0.956;
-      const hitFadeAlpha = 1 - Math.exp(-dt / PARTICLE_HIT_FADE_TIME);
-      particleColorMix[i] = Math.max(0, particleColorMix[i] - dt / PARTICLE_COLOR_FADE_TIME);
-      let speed = Math.sqrt(vx * vx + vy * vy + vz * vz);
-      const planarSpeed = Math.sqrt(vx * vx + vy * vy);
-      const eddy = particleWake[i] * clamp(planarSpeed * 0.016 * turbulence, 0, 0.085) * frame;
-      if (eddy > 0.0001) {
-        const spin = particleSpin[i];
-        const prevVx = vx;
-        const prevVy = vy;
-        vz += Math.sin(t * 1.55 + seed * 6.283) * eddy * 0.42;
-        vx += -prevVy * spin * eddy * 0.08;
-        vy += prevVx * spin * eddy * 0.08;
-      }
-
-      speed = Math.sqrt(vx * vx + vy * vy + vz * vz);
-      const effectiveFriction = getEffectiveFriction();
-      const dragBase = 0.994 - effectiveFriction * 0.018;
-      const dragMin = 0.968 - effectiveFriction * 0.036;
-      const dragMax = 0.998 - effectiveFriction * 0.004;
-      const drag = clamp(
-        dragBase - speed * 0.00045 * frame - particleWake[i] * 0.0026 * frame,
-        dragMin,
-        dragMax
-      );
-      vx *= drag;
-      vy *= drag;
-      vz *= clamp(drag - 0.008, 0.9, 0.988);
-
-      if (speed < 0.0025) {
-        vx *= 0.8;
-        vy *= 0.8;
-        vz *= 0.72;
-      }
-
-      particlePositions[o] = px + vx * frame;
-      particlePositions[o + 1] = py + vy * frame;
-      particlePositions[o + 2] = pz + vz * frame;
-      particleVelocities[o] = vx;
-      particleVelocities[o + 1] = vy;
-      particleVelocities[o + 2] = vz;
-
-      const assignedR = particleAssignedColors[o];
-      const assignedG = particleAssignedColors[o + 1];
-      const assignedB = particleAssignedColors[o + 2];
-      const hasAssignedColor = assignedR >= 0 && assignedG >= 0 && assignedB >= 0;
-      const glowTarget = PARTICLE_GLOW_BASE +
-        particleWake[i] * PARTICLE_GLOW_WAKE +
-        clamp(speed * PARTICLE_GLOW_SPEED, 0, 0.38);
-      particleAssignedIntensity[i] += (0 - particleAssignedIntensity[i]) * hitFadeAlpha;
-      particleAssignedIntensity[i] = clamp(particleAssignedIntensity[i], 0, PARTICLE_INTENSITY_MAX);
-      const emissionMix = clamp(particleAssignedIntensity[i] / PARTICLE_INTENSITY_MAX, 0, 1);
-
-      if (
-        hasAssignedColor &&
-        particleColorMix[i] <= 0.0001 &&
-        emissionMix <= 0.002 &&
-        particleWake[i] <= 0.01
-      ) {
-        particleAssignedLetter[i] = -1;
-        particleAssignedColors[o] = -1;
-        particleAssignedColors[o + 1] = -1;
-        particleAssignedColors[o + 2] = -1;
-      }
-
-      const inheritedMix = hasAssignedColor ? particleColorMix[i] : 0;
-      const normalSpeedGlow = clamp(0.44 + speed * 0.026, 0.44, 0.52);
-      const flashSpeedGlow = clamp(1.1 + speed * 0.16, 1.1, 1.34);
-      const speedGlow = normalSpeedGlow + (flashSpeedGlow - normalSpeedGlow) * emissionMix;
-      const normalWhiteMix = clamp(0.008 + speed * 0.003, 0.008, 0.016);
-      const flashWhiteMix = clamp(speed * 0.004, 0.0, 0.012);
-      const whiteMix = normalWhiteMix + (flashWhiteMix - normalWhiteMix) * emissionMix;
-      const inheritedR = assignedR >= 0 ? assignedR : TEAL.r;
-      const inheritedG = assignedG >= 0 ? assignedG : TEAL.g;
-      const inheritedB = assignedB >= 0 ? assignedB : TEAL.b;
-      const baseR = TEAL.r + (inheritedR - TEAL.r) * inheritedMix;
-      const baseG = TEAL.g + (inheritedG - TEAL.g) * inheritedMix;
-      const baseB = TEAL.b + (inheritedB - TEAL.b) * inheritedMix;
-      const glowBoost = clamp(
-        1 + emissionMix * (PARTICLE_GLOW_BOOST_MAX - 1),
-        1,
-        PARTICLE_GLOW_BOOST_MAX
-      );
-      const pulse = 1 + Math.sin(pulseTime * 8 + seed * 9) * (0.02 + emissionMix * 0.03);
-      particleColors[o] = clamp(baseR * glowTarget * speedGlow * glowBoost * pulse + whiteMix, 0, PARTICLE_COLOR_CHANNEL_MAX);
-      particleColors[o + 1] = clamp(baseG * glowTarget * speedGlow * glowBoost * pulse + whiteMix, 0, PARTICLE_COLOR_CHANNEL_MAX);
-      particleColors[o + 2] = clamp(baseB * glowTarget * speedGlow * glowBoost * pulse + whiteMix, 0, PARTICLE_COLOR_CHANNEL_MAX);
+  if (particleMaterial?.uniforms?.uLetterColors) {
+    for (let i = 0; i < LETTER_COUNT; i++) {
+      particleMaterial.uniforms.uLetterColors.value[i].copy(letterPalette[i]);
     }
+  }
 
-    positionAttr.needsUpdate = true;
-    colorAttr.needsUpdate = true;
+  if (gpuParticleController && particleMaterial) {
+    tmpV1.set(pointerLocalX, pointerLocalY, pointerLocalZ);
+    gpuParticleController.step(
+      dt,
+      frame,
+      t,
+      tmpV1,
+      pointerEnergy,
+      pointer.active && pointer.ready,
+      hitRadius
+    );
   }
 
   const targetRotY = Math.sin(t * 0.28) * 0.06 + pointer.ndcSmooth.x * 0.16;
@@ -1899,6 +2678,13 @@ function animate() {
   logoRig.rotation.x += (targetRotX - logoRig.rotation.x) * 0.05;
   logoRig.position.y += (Math.sin(t * 0.48) * 5 - logoRig.position.y) * 0.035;
   backgroundHalo.material.rotation += 0.00035;
+
+  if (cursorSphere.visible) {
+    logoRig.updateMatrixWorld(true);
+    tmpCursorWorld.set(pointerLocalX, pointerLocalY, pointerLocalZ).applyMatrix4(logoRig.matrixWorld);
+    cursorSphere.position.copy(tmpCursorWorld);
+    cursorSphere.scale.setScalar(hitRadius * logoRig.scale.x);
+  }
 
   composer.render();
 }
@@ -1936,8 +2722,8 @@ renderer.domElement.addEventListener("pointermove", (event) => {
   pointer.screen.set(screenX, screenY);
   pointer.active = true;
   pointer.ndc.set(
-    (screenX / rect.width) * 2 - 1,
-    -(((event.clientY - rect.top) / rect.height) * 2 - 1)
+    (screenX / Math.max(rect.width, 1)) * 2 - 1,
+    -((((event.clientY - rect.top) / Math.max(rect.height, 1)) * 2) - 1)
   );
   updatePointerProjection(true);
 });
