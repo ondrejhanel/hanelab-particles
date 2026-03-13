@@ -59,6 +59,8 @@ const PARTICLE_SIZE_RANDOMNESS_MIN = 0;
 const PARTICLE_SIZE_RANDOMNESS_MAX = 1;
 const ACTIVITY_GAIN_MIN = 0.2;
 const ACTIVITY_GAIN_MAX = 4;
+const AMBIENT_FLOW_SPEED_MIN = 0;
+const AMBIENT_FLOW_SPEED_MAX = 2.5;
 const CURSOR_SPHERE_COLOR = 0x7afcf2;
 const TEXT_COLLIDER_MARGIN = 10;
 const TEXT_COLLIDER_FORCE = 0.24;
@@ -104,14 +106,32 @@ const FLUID_JACOBI_STEPS = 4;
 const FLUID_MAX_VELOCITY = 36;
 const FLUID_SAMPLE_SCALE = 0.22;
 const FLUID_MIN_IMPULSE_PX = 12;
+const DESKTOP_TUNING_VIEWPORT = Object.freeze({ shortSide: 1440, longSide: 3440 });
+const MOBILE_TUNING_VIEWPORT = Object.freeze({ shortSide: 390, longSide: 844 });
 const DEFAULT_MOTION_TUNING = Object.freeze({
   friction: 0.3504,
   viscosity: 0.35,
   radius: 0.25,
   showCursor: false,
   activityGain: 1.0,
+  ambientFlowEnabled: true,
+  ambientFlowSpeed: 0.30,
   particleCount: 500800,
   particleSize: 5.0,
+  particleOpacity: 1.0,
+  particleOpacityRandomness: 0.5,
+  particleSizeRandomness: 0.5
+});
+const MOBILE_MOTION_TUNING = Object.freeze({
+  friction: 0.3504,
+  viscosity: 0.35,
+  radius: 0.15,
+  showCursor: false,
+  activityGain: 1.0,
+  ambientFlowEnabled: true,
+  ambientFlowSpeed: 0.15,
+  particleCount: 222100,
+  particleSize: 3.7,
   particleOpacity: 1.0,
   particleOpacityRandomness: 0.5,
   particleSizeRandomness: 0.5
@@ -119,7 +139,10 @@ const DEFAULT_MOTION_TUNING = Object.freeze({
 
 const container = document.getElementById("app");
 if (!container) throw new Error("Missing #app container");
+syncViewportHost();
+const tuningUi = document.getElementById("tuning-ui");
 const tuningPanel = document.getElementById("tuning-panel");
+const tuningToggleButton = document.getElementById("tuning-toggle");
 const tuningResetButton = document.getElementById("tuning-reset");
 const frictionInput = document.getElementById("tuning-friction");
 const frictionNumberInput = document.getElementById("tuning-friction-number");
@@ -130,6 +153,9 @@ const radiusNumberInput = document.getElementById("tuning-radius-number");
 const showCursorInput = document.getElementById("tuning-show-cursor");
 const activityGainInput = document.getElementById("tuning-activity-gain");
 const activityGainNumberInput = document.getElementById("tuning-activity-gain-number");
+const ambientFlowEnabledInput = document.getElementById("tuning-ambient-flow-enabled");
+const ambientFlowSpeedInput = document.getElementById("tuning-ambient-flow-speed");
+const ambientFlowSpeedNumberInput = document.getElementById("tuning-ambient-flow-speed-number");
 const particleCountInput = document.getElementById("tuning-particle-count");
 const particleCountNumberInput = document.getElementById("tuning-particle-count-number");
 const particleSizeInput = document.getElementById("tuning-particle-size");
@@ -140,6 +166,7 @@ const particleOpacityRandomnessInput = document.getElementById("tuning-particle-
 const particleOpacityRandomnessNumberInput = document.getElementById("tuning-particle-opacity-randomness-number");
 const particleSizeRandomnessInput = document.getElementById("tuning-particle-size-randomness");
 const particleSizeRandomnessNumberInput = document.getElementById("tuning-particle-size-randomness-number");
+let motionTuningUsesResponsiveDefaults = false;
 const motionTuning = loadMotionTuning();
 
 const scene = new THREE.Scene();
@@ -158,7 +185,7 @@ renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 0.96;
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-renderer.setSize(1, 1, false);
+renderer.setSize(1, 1, true);
 container.appendChild(renderer.domElement);
 
 const composer = new EffectComposer(renderer);
@@ -235,6 +262,9 @@ let positionAttr = null;
 let sizeVarianceAttr = null;
 let particleReferenceAttr = null;
 let isMobileLayout = false;
+let tuningPanelHidden = false;
+let tuningPanelVisibilityCustomized = false;
+let activePointerId = null;
 let logoBounds = new THREE.Vector3(420, 180, 70);
 let particleField = new THREE.Vector3(520, 220, 360);
 let viewportBounds = new THREE.Vector2(520, 220);
@@ -275,6 +305,7 @@ const tmpCursorWorld = new THREE.Vector3();
 const tmpFlowA = new THREE.Vector2();
 const tmpFlowB = new THREE.Vector2();
 const tmpFlowC = new THREE.Vector2();
+const tmpFlowBounds = new THREE.Vector2();
 const tmpBoundaryForce = new THREE.Vector3();
 const tmpCursorHalfExtents = new THREE.Vector3();
 const tmpCursorNormal = new THREE.Vector3();
@@ -292,6 +323,15 @@ cycleInnerColor.copy(TEAL_SOFT);
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
+}
+
+function smoothstep01(value) {
+  const t = clamp(value, 0, 1);
+  return t * t * (3 - 2 * t);
+}
+
+function mixNumber(from, to, alpha) {
+  return from + (to - from) * alpha;
 }
 
 function packNormalizedByte(value) {
@@ -640,6 +680,10 @@ function normalizeActivityGain(value) {
   return clamp(value, ACTIVITY_GAIN_MIN, ACTIVITY_GAIN_MAX);
 }
 
+function normalizeAmbientFlowSpeed(value) {
+  return clamp(value, AMBIENT_FLOW_SPEED_MIN, AMBIENT_FLOW_SPEED_MAX);
+}
+
 function normalizeViscosity(value) {
   return clamp(value, VISCOSITY_MIN, VISCOSITY_MAX);
 }
@@ -650,6 +694,265 @@ function normalizeParticleSizeRandomness(value) {
 
 function normalizeParticleOpacityRandomness(value) {
   return clamp(value, PARTICLE_OPACITY_RANDOMNESS_MIN, PARTICLE_OPACITY_RANDOMNESS_MAX);
+}
+
+function getVisualViewportMetrics() {
+  const visualViewport = window.visualViewport;
+  return {
+    width: Math.max(
+      1,
+      Math.floor(
+        visualViewport?.width ||
+        document.documentElement.clientWidth ||
+        window.innerWidth ||
+        1
+      )
+    ),
+    height: Math.max(
+      1,
+      Math.floor(
+        visualViewport?.height ||
+        document.documentElement.clientHeight ||
+        window.innerHeight ||
+        1
+      )
+    )
+  };
+}
+
+function syncViewportHost() {
+  const visualViewport = window.visualViewport;
+  const metrics = getVisualViewportMetrics();
+  const offsetLeft = Math.max(0, visualViewport?.offsetLeft || 0);
+  const offsetTop = Math.max(0, visualViewport?.offsetTop || 0);
+  container.style.left = `${offsetLeft}px`;
+  container.style.top = `${offsetTop}px`;
+  container.style.width = `${metrics.width}px`;
+  container.style.height = `${metrics.height}px`;
+  return metrics;
+}
+
+function getViewportDimensions() {
+  const synced = syncViewportHost();
+  const rect = container.getBoundingClientRect();
+  return {
+    width: Math.max(1, Math.floor(synced.width || rect.width || window.innerWidth || 1)),
+    height: Math.max(1, Math.floor(synced.height || rect.height || window.innerHeight || 1))
+  };
+}
+
+function getResponsiveDefaultBlend(width, height) {
+  const shortSide = Math.min(width, height);
+  const longSide = Math.max(width, height);
+  const shortBlend = clamp(
+    (shortSide - MOBILE_TUNING_VIEWPORT.shortSide) /
+      Math.max(DESKTOP_TUNING_VIEWPORT.shortSide - MOBILE_TUNING_VIEWPORT.shortSide, 1),
+    0,
+    1
+  );
+  const longBlend = clamp(
+    (longSide - MOBILE_TUNING_VIEWPORT.longSide) /
+      Math.max(DESKTOP_TUNING_VIEWPORT.longSide - MOBILE_TUNING_VIEWPORT.longSide, 1),
+    0,
+    1
+  );
+  return smoothstep01(shortBlend * 0.72 + longBlend * 0.28);
+}
+
+function getResponsiveDefaultMotionTuning(width, height) {
+  const desktopMix = getResponsiveDefaultBlend(width, height);
+  return {
+    friction: clamp(
+      mixNumber(MOBILE_MOTION_TUNING.friction, DEFAULT_MOTION_TUNING.friction, desktopMix),
+      FRICTION_MIN,
+      FRICTION_MAX
+    ),
+    viscosity: normalizeViscosity(
+      mixNumber(MOBILE_MOTION_TUNING.viscosity, DEFAULT_MOTION_TUNING.viscosity, desktopMix)
+    ),
+    radius: clamp(
+      mixNumber(MOBILE_MOTION_TUNING.radius, DEFAULT_MOTION_TUNING.radius, desktopMix),
+      RADIUS_MIN,
+      RADIUS_MAX
+    ),
+    showCursor: desktopMix >= 0.5 ? DEFAULT_MOTION_TUNING.showCursor : MOBILE_MOTION_TUNING.showCursor,
+    activityGain: normalizeActivityGain(
+      mixNumber(MOBILE_MOTION_TUNING.activityGain, DEFAULT_MOTION_TUNING.activityGain, desktopMix)
+    ),
+    ambientFlowEnabled: desktopMix >= 0.5
+      ? DEFAULT_MOTION_TUNING.ambientFlowEnabled
+      : MOBILE_MOTION_TUNING.ambientFlowEnabled,
+    ambientFlowSpeed: normalizeAmbientFlowSpeed(
+      mixNumber(MOBILE_MOTION_TUNING.ambientFlowSpeed, DEFAULT_MOTION_TUNING.ambientFlowSpeed, desktopMix)
+    ),
+    particleCount: normalizeParticleCount(
+      mixNumber(MOBILE_MOTION_TUNING.particleCount, DEFAULT_MOTION_TUNING.particleCount, desktopMix)
+    ),
+    particleSize: normalizeParticleSize(
+      mixNumber(MOBILE_MOTION_TUNING.particleSize, DEFAULT_MOTION_TUNING.particleSize, desktopMix)
+    ),
+    particleOpacity: normalizeParticleOpacity(
+      mixNumber(MOBILE_MOTION_TUNING.particleOpacity, DEFAULT_MOTION_TUNING.particleOpacity, desktopMix)
+    ),
+    particleOpacityRandomness: normalizeParticleOpacityRandomness(
+      mixNumber(
+        MOBILE_MOTION_TUNING.particleOpacityRandomness,
+        DEFAULT_MOTION_TUNING.particleOpacityRandomness,
+        desktopMix
+      )
+    ),
+    particleSizeRandomness: normalizeParticleSizeRandomness(
+      mixNumber(
+        MOBILE_MOTION_TUNING.particleSizeRandomness,
+        DEFAULT_MOTION_TUNING.particleSizeRandomness,
+        desktopMix
+      )
+    )
+  };
+}
+
+function getCurrentDefaultMotionTuning() {
+  const { width, height } = getViewportDimensions();
+  return getResponsiveDefaultMotionTuning(width, height);
+}
+
+function getFluidFieldBounds(target) {
+  const shellBounds = getParticleSoftBounds(tmpV4);
+  target.set(shellBounds.x, shellBounds.y);
+  return target;
+}
+
+function isTuningUiTarget(target) {
+  return target instanceof Element && (
+    !!target.closest("#tuning-ui")
+  );
+}
+
+function syncTuningPanelVisibility() {
+  if (tuningUi) {
+    tuningUi.dataset.panelHidden = tuningPanelHidden ? "true" : "false";
+  }
+  if (tuningPanel) {
+    tuningPanel.hidden = tuningPanelHidden;
+  }
+  if (tuningToggleButton) {
+    tuningToggleButton.textContent = tuningPanelHidden ? "Show Controls" : "Hide Controls";
+    tuningToggleButton.setAttribute("aria-expanded", tuningPanelHidden ? "false" : "true");
+  }
+}
+
+function setTuningPanelHidden(hidden, { user = false } = {}) {
+  const nextHidden = !!hidden;
+  if (user) {
+    tuningPanelVisibilityCustomized = true;
+  }
+  if (tuningPanelHidden === nextHidden) {
+    syncTuningPanelVisibility();
+    return;
+  }
+  tuningPanelHidden = nextHidden;
+  syncTuningPanelVisibility();
+  stopPointerInteraction();
+}
+
+function applyMotionTuningPreset(preset, { save = false, stopPointer = false, resizeDelayMs = 0 } = {}) {
+  if (!preset) return false;
+  const next = {
+    friction: clamp(preset.friction, FRICTION_MIN, FRICTION_MAX),
+    viscosity: normalizeViscosity(preset.viscosity),
+    radius: clamp(preset.radius, RADIUS_MIN, RADIUS_MAX),
+    showCursor: preset.showCursor !== false,
+    activityGain: normalizeActivityGain(preset.activityGain),
+    ambientFlowEnabled: preset.ambientFlowEnabled !== false,
+    ambientFlowSpeed: normalizeAmbientFlowSpeed(preset.ambientFlowSpeed),
+    particleCount: normalizeParticleCount(preset.particleCount),
+    particleSize: normalizeParticleSize(preset.particleSize),
+    particleOpacity: normalizeParticleOpacity(preset.particleOpacity),
+    particleOpacityRandomness: normalizeParticleOpacityRandomness(preset.particleOpacityRandomness),
+    particleSizeRandomness: normalizeParticleSizeRandomness(preset.particleSizeRandomness)
+  };
+
+  let changed = false;
+  let resizeNeeded = false;
+  let materialChanged = false;
+  let fluidChanged = false;
+
+  if (Math.abs(motionTuning.friction - next.friction) > 0.000001) {
+    motionTuning.friction = next.friction;
+    changed = true;
+  }
+  if (Math.abs(motionTuning.viscosity - next.viscosity) > 0.000001) {
+    motionTuning.viscosity = next.viscosity;
+    changed = true;
+    fluidChanged = true;
+  }
+  if (Math.abs(motionTuning.radius - next.radius) > 0.000001) {
+    motionTuning.radius = next.radius;
+    changed = true;
+  }
+  if ((motionTuning.showCursor !== false) !== next.showCursor) {
+    motionTuning.showCursor = next.showCursor;
+    changed = true;
+  }
+  if (Math.abs(motionTuning.activityGain - next.activityGain) > 0.000001) {
+    motionTuning.activityGain = next.activityGain;
+    changed = true;
+  }
+  if ((motionTuning.ambientFlowEnabled !== false) !== next.ambientFlowEnabled) {
+    motionTuning.ambientFlowEnabled = next.ambientFlowEnabled;
+    changed = true;
+  }
+  if (Math.abs(motionTuning.ambientFlowSpeed - next.ambientFlowSpeed) > 0.000001) {
+    motionTuning.ambientFlowSpeed = next.ambientFlowSpeed;
+    changed = true;
+  }
+  if (motionTuning.particleCount !== next.particleCount || particleTargetCount !== next.particleCount) {
+    motionTuning.particleCount = next.particleCount;
+    particleTargetCount = next.particleCount;
+    changed = true;
+    resizeNeeded = next.particleCount !== particleCount;
+  }
+  if (Math.abs(motionTuning.particleSize - next.particleSize) > 0.000001) {
+    motionTuning.particleSize = next.particleSize;
+    changed = true;
+    materialChanged = true;
+  }
+  if (Math.abs(motionTuning.particleOpacity - next.particleOpacity) > 0.000001) {
+    motionTuning.particleOpacity = next.particleOpacity;
+    changed = true;
+    materialChanged = true;
+  }
+  if (Math.abs(motionTuning.particleOpacityRandomness - next.particleOpacityRandomness) > 0.000001) {
+    motionTuning.particleOpacityRandomness = next.particleOpacityRandomness;
+    changed = true;
+    materialChanged = true;
+  }
+  if (Math.abs(motionTuning.particleSizeRandomness - next.particleSizeRandomness) > 0.000001) {
+    motionTuning.particleSizeRandomness = next.particleSizeRandomness;
+    changed = true;
+    materialChanged = true;
+  }
+
+  if (!changed) return false;
+
+  syncTuningPanel();
+  syncTuningPanelVisibility();
+  if (fluidChanged) {
+    gpuFluid?.updateDimensions();
+  }
+  if (materialChanged || resizeNeeded) {
+    updateParticleMaterialTuning();
+  }
+  if (stopPointer) {
+    stopPointerInteraction();
+  }
+  if (resizeNeeded && particleCount > 0) {
+    scheduleParticleResize(resizeDelayMs);
+  }
+  if (save) {
+    saveMotionTuning();
+  }
+  return true;
 }
 
 function getLegacyBaseParticleSize() {
@@ -726,21 +1029,27 @@ function getParticleVisualDensity(count, particleSize) {
 }
 
 function loadMotionTuning() {
-  const defaults = DEFAULT_MOTION_TUNING;
+  const defaults = getCurrentDefaultMotionTuning();
   try {
     const raw = window.localStorage.getItem(TUNING_STORAGE_KEY);
-    if (!raw) return { ...defaults };
+    if (!raw) {
+      motionTuningUsesResponsiveDefaults = true;
+      return { ...defaults };
+    }
     const parsed = JSON.parse(raw);
     const parsedFriction = Number(parsed.friction);
     const parsedViscosity = Number(parsed.viscosity);
     const parsedRadius = Number(parsed.radius);
     const parsedShowCursor = parsed.showCursor;
     const parsedActivityGain = Number(parsed.activityGain);
+    const parsedAmbientFlowEnabled = parsed.ambientFlowEnabled;
+    const parsedAmbientFlowSpeed = Number(parsed.ambientFlowSpeed);
     const parsedParticleCount = parsed.particleCount == null ? null : Number(parsed.particleCount);
     const parsedParticleSize = Number(parsed.particleSize);
     const parsedParticleOpacity = Number(parsed.particleOpacity);
     const parsedParticleOpacityRandomness = Number(parsed.particleOpacityRandomness);
     const parsedParticleSizeRandomness = Number(parsed.particleSizeRandomness);
+    motionTuningUsesResponsiveDefaults = parsed.responsiveDefaults === true;
     const normalizedRadius = Number.isFinite(parsedRadius)
       ? parsedRadius > 1
         ? (parsedRadius - LEGACY_RADIUS_MIN) / Math.max(LEGACY_RADIUS_MAX - LEGACY_RADIUS_MIN, 0.001)
@@ -762,6 +1071,12 @@ function loadMotionTuning() {
       activityGain: Number.isFinite(parsedActivityGain)
         ? normalizeActivityGain(parsedActivityGain)
         : defaults.activityGain,
+      ambientFlowEnabled: typeof parsedAmbientFlowEnabled === "boolean"
+        ? parsedAmbientFlowEnabled
+        : defaults.ambientFlowEnabled,
+      ambientFlowSpeed: Number.isFinite(parsedAmbientFlowSpeed)
+        ? normalizeAmbientFlowSpeed(parsedAmbientFlowSpeed)
+        : defaults.ambientFlowSpeed,
       particleCount: parsedParticleCount != null && Number.isFinite(parsedParticleCount)
         ? normalizeParticleCount(parsedParticleCount)
         : defaults.particleCount,
@@ -783,13 +1098,17 @@ function loadMotionTuning() {
         : defaults.particleSizeRandomness
     };
   } catch {
+    motionTuningUsesResponsiveDefaults = true;
     return { ...defaults };
   }
 }
 
 function saveMotionTuning() {
   try {
-    window.localStorage.setItem(TUNING_STORAGE_KEY, JSON.stringify(motionTuning));
+    window.localStorage.setItem(TUNING_STORAGE_KEY, JSON.stringify({
+      ...motionTuning,
+      responsiveDefaults: motionTuningUsesResponsiveDefaults
+    }));
   } catch {
     // Ignore storage failures; runtime tuning still works for the session.
   }
@@ -824,6 +1143,9 @@ function syncTuningPanel() {
   if (showCursorInput) showCursorInput.checked = motionTuning.showCursor !== false;
   if (activityGainInput) activityGainInput.value = motionTuning.activityGain.toFixed(2);
   if (activityGainNumberInput) activityGainNumberInput.value = (motionTuning.activityGain * 100).toFixed(0);
+  if (ambientFlowEnabledInput) ambientFlowEnabledInput.checked = motionTuning.ambientFlowEnabled !== false;
+  if (ambientFlowSpeedInput) ambientFlowSpeedInput.value = motionTuning.ambientFlowSpeed.toFixed(2);
+  if (ambientFlowSpeedNumberInput) ambientFlowSpeedNumberInput.value = (motionTuning.ambientFlowSpeed * 100).toFixed(1);
   if (particleCountInput) particleCountInput.value = String(displayParticleCount);
   if (particleCountNumberInput) particleCountNumberInput.value = String(displayParticleCount);
   if (particleSizeInput) particleSizeInput.value = motionTuning.particleSize.toFixed(1);
@@ -849,6 +1171,7 @@ function syncTuningPanel() {
 function setupTuningPanel() {
   const applyFriction = (value) => {
     if (!Number.isFinite(value)) return;
+    motionTuningUsesResponsiveDefaults = false;
     motionTuning.friction = clamp(value, FRICTION_MIN, FRICTION_MAX);
     syncTuningPanel();
     saveMotionTuning();
@@ -856,6 +1179,7 @@ function setupTuningPanel() {
 
   const applyViscosity = (value) => {
     if (!Number.isFinite(value)) return;
+    motionTuningUsesResponsiveDefaults = false;
     motionTuning.viscosity = normalizeViscosity(value);
     syncTuningPanel();
     gpuFluid?.updateDimensions();
@@ -864,12 +1188,14 @@ function setupTuningPanel() {
 
   const applyRadius = (value) => {
     if (!Number.isFinite(value)) return;
+    motionTuningUsesResponsiveDefaults = false;
     motionTuning.radius = clamp(value, RADIUS_MIN, RADIUS_MAX);
     syncTuningPanel();
     saveMotionTuning();
   };
 
   const applyShowCursor = (value) => {
+    motionTuningUsesResponsiveDefaults = false;
     motionTuning.showCursor = value !== false;
     syncTuningPanel();
     saveMotionTuning();
@@ -877,13 +1203,30 @@ function setupTuningPanel() {
 
   const applyActivityGain = (value) => {
     if (!Number.isFinite(value)) return;
+    motionTuningUsesResponsiveDefaults = false;
     motionTuning.activityGain = normalizeActivityGain(value);
+    syncTuningPanel();
+    saveMotionTuning();
+  };
+
+  const applyAmbientFlowEnabled = (value) => {
+    motionTuningUsesResponsiveDefaults = false;
+    motionTuning.ambientFlowEnabled = value !== false;
+    syncTuningPanel();
+    saveMotionTuning();
+  };
+
+  const applyAmbientFlowSpeed = (value) => {
+    if (!Number.isFinite(value)) return;
+    motionTuningUsesResponsiveDefaults = false;
+    motionTuning.ambientFlowSpeed = normalizeAmbientFlowSpeed(value);
     syncTuningPanel();
     saveMotionTuning();
   };
 
   const applyParticleCount = (value) => {
     if (!Number.isFinite(value)) return;
+    motionTuningUsesResponsiveDefaults = false;
     motionTuning.particleCount = normalizeParticleCount(value);
     particleTargetCount = motionTuning.particleCount;
     syncTuningPanel();
@@ -893,6 +1236,7 @@ function setupTuningPanel() {
 
   const applyParticleSize = (value) => {
     if (!Number.isFinite(value)) return;
+    motionTuningUsesResponsiveDefaults = false;
     motionTuning.particleSize = normalizeParticleSize(value);
     syncTuningPanel();
     updateParticleMaterialTuning();
@@ -901,6 +1245,7 @@ function setupTuningPanel() {
 
   const applyParticleOpacity = (value) => {
     if (!Number.isFinite(value)) return;
+    motionTuningUsesResponsiveDefaults = false;
     motionTuning.particleOpacity = normalizeParticleOpacity(value);
     syncTuningPanel();
     updateParticleMaterialTuning();
@@ -909,6 +1254,7 @@ function setupTuningPanel() {
 
   const applyParticleOpacityRandomness = (value) => {
     if (!Number.isFinite(value)) return;
+    motionTuningUsesResponsiveDefaults = false;
     motionTuning.particleOpacityRandomness = normalizeParticleOpacityRandomness(value);
     syncTuningPanel();
     updateParticleMaterialTuning();
@@ -917,6 +1263,7 @@ function setupTuningPanel() {
 
   const applyParticleSizeRandomness = (value) => {
     if (!Number.isFinite(value)) return;
+    motionTuningUsesResponsiveDefaults = false;
     motionTuning.particleSizeRandomness = normalizeParticleSizeRandomness(value);
     syncTuningPanel();
     updateParticleMaterialTuning();
@@ -924,13 +1271,12 @@ function setupTuningPanel() {
   };
 
   const applyDefaults = () => {
-    Object.assign(motionTuning, DEFAULT_MOTION_TUNING);
-    particleTargetCount = motionTuning.particleCount;
-    syncTuningPanel();
-    updateParticleMaterialTuning();
-    saveMotionTuning();
-    stopPointerInteraction();
-    scheduleParticleResize(0);
+    motionTuningUsesResponsiveDefaults = true;
+    applyMotionTuningPreset(getCurrentDefaultMotionTuning(), {
+      save: true,
+      stopPointer: true,
+      resizeDelayMs: 0
+    });
   };
 
   syncTuningPanel();
@@ -985,6 +1331,22 @@ function setupTuningPanel() {
 
   activityGainNumberInput?.addEventListener("change", () => {
     applyActivityGain(Number(activityGainNumberInput.value) / 100);
+  });
+
+  ambientFlowEnabledInput?.addEventListener("change", () => {
+    applyAmbientFlowEnabled(ambientFlowEnabledInput.checked);
+  });
+
+  ambientFlowSpeedInput?.addEventListener("input", () => {
+    applyAmbientFlowSpeed(Number(ambientFlowSpeedInput.value));
+  });
+
+  ambientFlowSpeedNumberInput?.addEventListener("input", () => {
+    applyAmbientFlowSpeed(Number(ambientFlowSpeedNumberInput.value) / 100);
+  });
+
+  ambientFlowSpeedNumberInput?.addEventListener("change", () => {
+    applyAmbientFlowSpeed(Number(ambientFlowSpeedNumberInput.value) / 100);
   });
 
   particleCountInput?.addEventListener("input", () => {
@@ -1049,6 +1411,10 @@ function setupTuningPanel() {
 
   tuningResetButton?.addEventListener("click", () => {
     applyDefaults();
+  });
+
+  tuningToggleButton?.addEventListener("click", () => {
+    setTuningPanelHidden(!tuningPanelHidden, { user: true });
   });
 }
 
@@ -1202,7 +1568,7 @@ uniform float uPointerEnergy;
 uniform float uHitRadius;
 uniform vec3 uPointerPosition;
 uniform vec3 uOuterBounds;
-uniform vec2 uViewportBounds;
+uniform vec2 uFluidBounds;
 
 float hash11(const float value) {
   return fract(sin(value * 127.1) * 43758.5453123);
@@ -1222,7 +1588,7 @@ float particleIndex() {
 }
 
 vec2 fluidUvForWorld(const vec2 world) {
-  return clamp((world + uViewportBounds) / (uViewportBounds * 2.0), 0.0, 1.0);
+  return clamp((world + uFluidBounds) / (uFluidBounds * 2.0), 0.0, 1.0);
 }
 
 vec2 sampleFluidField(const vec3 position, const float seed) {
@@ -1613,7 +1979,7 @@ function createGpuParticleController(count) {
     uniforms.uHitRadius = { value: 0 };
     uniforms.uPointerPosition = { value: new THREE.Vector3() };
     uniforms.uOuterBounds = { value: new THREE.Vector3() };
-    uniforms.uViewportBounds = { value: new THREE.Vector2() };
+    uniforms.uFluidBounds = { value: new THREE.Vector2() };
   }
   const error = gpuCompute.init();
   if (error) {
@@ -1622,6 +1988,7 @@ function createGpuParticleController(count) {
 
   function updateSimulationUniforms(dt, frameScale, time, pointerPosition, pointerEnergy, pointerActive, hitRadius) {
     const outerBounds = getParticleSoftBounds(tmpV4);
+    const fluidBounds = getFluidFieldBounds(tmpFlowBounds);
 
     for (const variable of allVariables) {
       const uniforms = variable.material.uniforms;
@@ -1636,7 +2003,7 @@ function createGpuParticleController(count) {
       uniforms.uHitRadius.value = hitRadius;
       uniforms.uPointerPosition.value.copy(pointerPosition);
       uniforms.uOuterBounds.value.copy(outerBounds);
-      uniforms.uViewportBounds.value.copy(viewportBounds);
+      uniforms.uFluidBounds.value.copy(fluidBounds);
     }
 
     if (particleMaterial) {
@@ -2235,8 +2602,9 @@ function sampleFluidArrays(gridX, gridY, fieldX, fieldY, target) {
 }
 
 function toFluidGridPosition(worldX, worldY, target) {
-  const boundX = Math.max(viewportBounds.x, 1);
-  const boundY = Math.max(viewportBounds.y, 1);
+  const fluidBounds = getFluidFieldBounds(tmpFlowBounds);
+  const boundX = Math.max(fluidBounds.x, 1);
+  const boundY = Math.max(fluidBounds.y, 1);
   target.set(
     ((clamp(worldX, -boundX, boundX) + boundX) / (boundX * 2)) * (FLUID_COLS - 1),
     ((clamp(worldY, -boundY, boundY) + boundY) / (boundY * 2)) * (FLUID_ROWS - 1)
@@ -2259,18 +2627,20 @@ function getFluidCanvasMetrics() {
 
 function mapLocalPointToFluidScreen(localX, localY, target) {
   const { width, height } = getFluidCanvasMetrics();
+  const fluidBounds = getFluidFieldBounds(tmpFlowBounds);
   target.set(
-    ((clamp(localX, -viewportBounds.x, viewportBounds.x) + viewportBounds.x) / Math.max(viewportBounds.x * 2, 1)) * width,
-    ((clamp(localY, -viewportBounds.y, viewportBounds.y) + viewportBounds.y) / Math.max(viewportBounds.y * 2, 1)) * height
+    ((clamp(localX, -fluidBounds.x, fluidBounds.x) + fluidBounds.x) / Math.max(fluidBounds.x * 2, 1)) * width,
+    ((clamp(localY, -fluidBounds.y, fluidBounds.y) + fluidBounds.y) / Math.max(fluidBounds.y * 2, 1)) * height
   );
   return target;
 }
 
 function getFluidImpulseThickness() {
   const { width, height } = getFluidCanvasMetrics();
+  const fluidBounds = getFluidFieldBounds(tmpFlowBounds);
   const hitRadius = getMaxCursorRadius() * motionTuning.radius;
-  const scaleX = width / Math.max(viewportBounds.x * 2, 1);
-  const scaleY = height / Math.max(viewportBounds.y * 2, 1);
+  const scaleX = width / Math.max(fluidBounds.x * 2, 1);
+  const scaleY = height / Math.max(fluidBounds.y * 2, 1);
   return Math.max(FLUID_MIN_IMPULSE_PX, hitRadius * (scaleX + scaleY) * 0.5);
 }
 
@@ -2436,6 +2806,84 @@ function createGPUFluidController() {
       { name: "u_vector", value: [0, 0], type: FLOAT }
     ]
   });
+  const ambientFlow = new GPUProgram(gpuComposer, {
+    name: "ambientFlow",
+    fragmentShader: `
+      in vec2 v_uv;
+
+      uniform sampler2D u_velocity;
+      uniform float u_time;
+      uniform float u_strength;
+
+      out vec2 out_velocity;
+
+      void main() {
+        vec2 uv = v_uv * 2.0 - 1.0;
+        vec2 velocity = texture(u_velocity, v_uv).xy;
+        float strength = clamp(u_strength, 0.0, ${AMBIENT_FLOW_SPEED_MAX.toFixed(6)});
+
+        if (strength <= 0.0001) {
+          out_velocity = velocity;
+          return;
+        }
+
+        float gain = strength / ${AMBIENT_FLOW_SPEED_MAX.toFixed(6)};
+        float phase = u_time * mix(0.05, 0.55, gain);
+
+        float psiA =
+          sin(uv.x * 2.1 + phase * 0.73) *
+          sin(uv.y * 1.45 - phase * 0.41);
+        float psiB =
+          0.42 *
+          sin(uv.x * 4.0 - phase * 0.28 + 1.3) *
+          sin(uv.y * 3.15 + phase * 0.49 - 0.8);
+        float psiC =
+          0.18 *
+          sin((uv.x + uv.y) * 2.3 + phase * 0.22) *
+          cos((uv.x - uv.y) * 1.7 - phase * 0.31);
+
+        float dPsiDy =
+          sin(uv.x * 2.1 + phase * 0.73) *
+          cos(uv.y * 1.45 - phase * 0.41) * 1.45 +
+          0.42 *
+          sin(uv.x * 4.0 - phase * 0.28 + 1.3) *
+          cos(uv.y * 3.15 + phase * 0.49 - 0.8) * 3.15 +
+          0.18 *
+          sin((uv.x + uv.y) * 2.3 + phase * 0.22) *
+          (-sin((uv.x - uv.y) * 1.7 - phase * 0.31)) * (-1.7) +
+          0.18 *
+          cos((uv.x + uv.y) * 2.3 + phase * 0.22) * 2.3 *
+          cos((uv.x - uv.y) * 1.7 - phase * 0.31);
+
+        float dPsiDx =
+          cos(uv.x * 2.1 + phase * 0.73) * 2.1 *
+          sin(uv.y * 1.45 - phase * 0.41) +
+          0.42 *
+          cos(uv.x * 4.0 - phase * 0.28 + 1.3) * 4.0 *
+          sin(uv.y * 3.15 + phase * 0.49 - 0.8) +
+          0.18 *
+          cos((uv.x + uv.y) * 2.3 + phase * 0.22) * 2.3 *
+          cos((uv.x - uv.y) * 1.7 - phase * 0.31) +
+          0.18 *
+          sin((uv.x + uv.y) * 2.3 + phase * 0.22) *
+          (-sin((uv.x - uv.y) * 1.7 - phase * 0.31)) * 1.7;
+
+        vec2 force = vec2(dPsiDy, -dPsiDx);
+        float amplitude = mix(0.0025, 0.0320, sqrt(gain)) * gain;
+        force *= amplitude;
+        velocity += force;
+
+        float velocityMag = length(velocity);
+        out_velocity = velocityMag > 0.00001
+          ? velocity / velocityMag * min(velocityMag, ${FLUID_MAX_VELOCITY.toFixed(1)})
+          : vec2(0.0);
+      }`,
+    uniforms: [
+      { name: "u_velocity", value: 0, type: INT },
+      { name: "u_time", value: 0, type: FLOAT },
+      { name: "u_strength", value: 0, type: FLOAT }
+    ]
+  });
 
   function updateDimensions() {
     const { width, height } = getFluidCanvasMetrics();
@@ -2445,8 +2893,9 @@ function createGPUFluidController() {
 
   function applyReadback(values) {
     const { width, height } = getFluidCanvasMetrics();
-    const scaleX = (viewportBounds.x * 2) / width * FLUID_SAMPLE_SCALE;
-    const scaleY = (viewportBounds.y * 2) / height * FLUID_SAMPLE_SCALE;
+    const fluidBounds = getFluidFieldBounds(tmpFlowBounds);
+    const scaleX = (fluidBounds.x * 2) / width * FLUID_SAMPLE_SCALE;
+    const scaleY = (fluidBounds.y * 2) / height * FLUID_SAMPLE_SCALE;
 
     for (let i = 0; i < FLUID_CELL_COUNT; i++) {
       const offset = i * 2;
@@ -2504,7 +2953,7 @@ function createGPUFluidController() {
     gpuComposer.resetThreeState();
   }
 
-  function step() {
+  function step(time) {
     gpuComposer.undoThreeState();
     updateDimensions();
     const hadPendingImpulses = pendingFluidImpulses.length > 0;
@@ -2526,6 +2975,17 @@ function createGPUFluidController() {
         endCaps: true
       });
     }
+
+    ambientFlow.setUniform("u_time", time);
+    ambientFlow.setUniform(
+      "u_strength",
+      motionTuning.ambientFlowEnabled !== false ? motionTuning.ambientFlowSpeed : 0
+    );
+    gpuComposer.step({
+      program: ambientFlow,
+      input: velocityState,
+      output: velocityState
+    });
 
     gpuComposer.step({
       program: advection,
@@ -2563,6 +3023,7 @@ function createGPUFluidController() {
     jacobi.dispose();
     gradientSubtraction.dispose();
     touch.dispose();
+    ambientFlow.dispose();
     gpuComposer.dispose();
   }
 
@@ -2600,9 +3061,9 @@ function queueFluidImpulse(position1, position2) {
   });
 }
 
-function stepFluidField() {
+function stepFluidField(time) {
   if (!gpuFluid) return;
-  gpuFluid.step();
+  gpuFluid.step(time);
 }
 
 function updateFluidSimulationSize() {
@@ -2641,15 +3102,52 @@ function updatePointerProjection(updateMotion) {
   pointer.ready = true;
 }
 
+function getConstrainedPointerLocal(hitRadius, target) {
+  const shellBounds = getParticleSoftBounds(tmpV2);
+  target.set(
+    clamp(
+      pointer.local.x,
+      -Math.max(shellBounds.x - hitRadius, 0),
+      Math.max(shellBounds.x - hitRadius, 0)
+    ),
+    clamp(
+      pointer.local.y,
+      -Math.max(shellBounds.y - hitRadius, 0),
+      Math.max(shellBounds.y - hitRadius, 0)
+    ),
+    clamp(
+      pointer.local.z,
+      -Math.max(shellBounds.z - hitRadius, 0),
+      Math.max(shellBounds.z - hitRadius, 0)
+    )
+  );
+  return target;
+}
+
 function updateViewport() {
-  const rect = container.getBoundingClientRect();
-  const width = Math.max(1, Math.floor(rect.width || window.innerWidth));
-  const height = Math.max(1, Math.floor(rect.height || window.innerHeight));
+  syncViewportHost();
+  const { width, height } = getViewportDimensions();
 
   isMobileLayout = width < MOBILE_BREAKPOINT;
 
+  if (!tuningPanelVisibilityCustomized) {
+    setTuningPanelHidden(isMobileLayout);
+  } else {
+    syncTuningPanelVisibility();
+  }
+
+  if (motionTuningUsesResponsiveDefaults) {
+    const responsiveDefaultsChanged = applyMotionTuningPreset(
+      getResponsiveDefaultMotionTuning(width, height),
+      { resizeDelayMs: 0 }
+    );
+    if (responsiveDefaultsChanged) {
+      saveMotionTuning();
+    }
+  }
+
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-  renderer.setSize(width, height, false);
+  renderer.setSize(width, height, true);
   composer.setSize(width, height);
   bloomPass.setSize(width, height);
   updateFluidSimulationSize();
@@ -2669,26 +3167,18 @@ function updateViewport() {
   pointerViewport.height = height;
   pointerViewport.centerOffsetX = 0;
 
-  if (!isMobileLayout && tuningPanel) {
-    const panelRect = tuningPanel.getBoundingClientRect();
-    const panelLeft = clamp(panelRect.left - rect.left - 24, width * 0.62, width);
-    pointerViewport.width = Math.max(panelLeft, 1);
-    pointerViewport.centerOffsetX = pointerViewport.left + pointerViewport.width * 0.5 - width * 0.5;
-  }
-
   if (textReady) {
     const distance = camera.position.z;
     const visibleHeight = 2 * Math.tan(THREE.MathUtils.degToRad(camera.fov * 0.5)) * distance;
     const visibleWidth = visibleHeight * camera.aspect;
-    const usableWidthRatio = clamp(pointerViewport.width / Math.max(width, 1), isMobileLayout ? 1 : 0.62, 1);
-    const targetWidth = visibleWidth * usableWidthRatio * (isMobileLayout ? 0.82 : 0.69);
+    const targetWidth = visibleWidth * (isMobileLayout ? 0.82 : 0.69);
     const targetHeight = visibleHeight * (isMobileLayout ? 0.23 : 0.21);
     const scale = Math.min(
       targetWidth / Math.max(logoBounds.x, 1),
       targetHeight / Math.max(logoBounds.y, 1)
     );
     logoRig.scale.setScalar(scale);
-    logoRig.position.x = (pointerViewport.centerOffsetX / Math.max(width, 1)) * visibleWidth;
+    logoRig.position.x = 0;
     rimLight.position.x = logoRig.position.x;
     viewportBounds.set(
       (visibleWidth * 0.5) / Math.max(scale, 0.0001) * 0.96,
@@ -2752,31 +3242,15 @@ function animate() {
   }
 
   const pointerEnergy = clamp(pointer.speed * 0.075, 0, 8.5);
-  const shellBounds = getParticleSoftBounds(tmpV2);
-  const boundX = shellBounds.x;
-  const boundY = shellBounds.y;
-  const boundZ = shellBounds.z;
   const hitRadius = getMaxCursorRadius() * motionTuning.radius;
-  const hitRadiusSq = hitRadius * hitRadius;
-  const pointerLocalX = clamp(
-    pointer.local.x,
-    -Math.max(boundX - hitRadius, 0),
-    Math.max(boundX - hitRadius, 0)
-  );
-  const pointerLocalY = clamp(
-    pointer.local.y,
-    -Math.max(boundY - hitRadius, 0),
-    Math.max(boundY - hitRadius, 0)
-  );
-  const pointerLocalZ = clamp(
-    pointer.local.z,
-    -Math.max(boundZ - hitRadius, 0),
-    Math.max(boundZ - hitRadius, 0)
-  );
+  const constrainedPointerLocal = getConstrainedPointerLocal(hitRadius, tmpV1);
+  const pointerLocalX = constrainedPointerLocal.x;
+  const pointerLocalY = constrainedPointerLocal.y;
+  const pointerLocalZ = constrainedPointerLocal.z;
 
   cursorSphere.visible = motionTuning.showCursor !== false && pointer.active && pointer.ready && hitRadius > 0.001;
 
-  stepFluidField();
+  stepFluidField(t);
 
   const particleUniforms = particleMaterial?.userData.sizeUniforms;
   if (particleUniforms?.uParticlePulseTime) {
@@ -2824,6 +3298,12 @@ function animate() {
 }
 
 async function init() {
+  syncViewportHost();
+  if (motionTuningUsesResponsiveDefaults) {
+    applyMotionTuningPreset(getCurrentDefaultMotionTuning(), {
+      resizeDelayMs: 0
+    });
+  }
   const font = await loadFont(FONT_URL);
   buildText(font);
   textReady = true;
@@ -2837,6 +3317,16 @@ async function init() {
 }
 
 function stopPointerInteraction() {
+  if (activePointerId != null) {
+    try {
+      if (renderer.domElement.hasPointerCapture?.(activePointerId)) {
+        renderer.domElement.releasePointerCapture(activePointerId);
+      }
+    } catch {
+      // Ignore capture release failures; the interaction state reset is sufficient.
+    }
+  }
+  activePointerId = null;
   pointer.active = false;
   pointer.ready = false;
   pointer.speed = 0;
@@ -2844,7 +3334,7 @@ function stopPointerInteraction() {
   cursorSphere.visible = false;
 }
 
-function handlePointerMove(event) {
+function updatePointerFromEvent(event) {
   if (!(event.target instanceof Element)) return;
   const rect = renderer.domElement.getBoundingClientRect();
   const localX = event.clientX - rect.left;
@@ -2855,7 +3345,7 @@ function handlePointerMove(event) {
     return;
   }
 
-  if (tuningPanel?.contains(event.target) && event.buttons !== 0) {
+  if (isTuningUiTarget(event.target)) {
     stopPointerInteraction();
     return;
   }
@@ -2868,35 +3358,140 @@ function handlePointerMove(event) {
   );
   updatePointerProjection(true);
 
-  mapLocalPointToFluidScreen(pointer.local.x, pointer.local.y, tmpFlowC);
+  const hitRadius = getMaxCursorRadius() * motionTuning.radius;
+  getConstrainedPointerLocal(hitRadius, tmpV1);
+  mapLocalPointToFluidScreen(tmpV1.x, tmpV1.y, tmpFlowC);
   if (hadPointer) {
     queueFluidImpulse([pointer.screen.x, pointer.screen.y], [tmpFlowC.x, tmpFlowC.y]);
   }
   pointer.screen.copy(tmpFlowC);
 }
 
-window.addEventListener("pointermove", handlePointerMove, { passive: true });
-window.addEventListener("pointerup", stopPointerInteraction);
-window.addEventListener("pointercancel", stopPointerInteraction);
+function handlePointerDown(event) {
+  if (event.isPrimary === false) return;
+  if (event.pointerType === "mouse" && event.button !== 0) return;
+  if (!(event.target instanceof Element)) return;
+  if (isTuningUiTarget(event.target)) {
+    stopPointerInteraction();
+    return;
+  }
+  if (event.pointerType !== "mouse") {
+    activePointerId = event.pointerId;
+    if (event.cancelable) {
+      event.preventDefault();
+    }
+    try {
+      renderer.domElement.setPointerCapture?.(event.pointerId);
+    } catch {
+      // Pointer capture is a best-effort improvement for touch continuity.
+    }
+  }
+  updatePointerFromEvent(event);
+}
+
+function handlePointerMove(event) {
+  if (event.isPrimary === false) return;
+  if (event.pointerType !== "mouse") {
+    if (activePointerId == null || event.pointerId !== activePointerId) return;
+    if (event.cancelable) {
+      event.preventDefault();
+    }
+  }
+  updatePointerFromEvent(event);
+}
+
+function handlePointerEnd(event) {
+  if (event.pointerType !== "mouse" && activePointerId != null && event.pointerId !== activePointerId) {
+    return;
+  }
+  stopPointerInteraction();
+}
+
+window.addEventListener("pointerdown", handlePointerDown, { passive: false });
+window.addEventListener("pointermove", handlePointerMove, { passive: false });
+window.addEventListener("pointerup", handlePointerEnd);
+window.addEventListener("pointercancel", handlePointerEnd);
 window.addEventListener("blur", stopPointerInteraction);
 
 let resizeRaf = 0;
+let viewportSettleRaf = 0;
+const viewportSettleTimeouts = [];
+
+function runViewportUpdate() {
+  updateViewport();
+  updatePointerProjection(false);
+}
+
 function scheduleViewportUpdate() {
   cancelAnimationFrame(resizeRaf);
-  resizeRaf = requestAnimationFrame(() => {
-    updateViewport();
-    updatePointerProjection(false);
-  });
+  resizeRaf = requestAnimationFrame(runViewportUpdate);
+}
+
+function cancelInitialViewportSettle() {
+  if (viewportSettleRaf) {
+    cancelAnimationFrame(viewportSettleRaf);
+    viewportSettleRaf = 0;
+  }
+  while (viewportSettleTimeouts.length > 0) {
+    window.clearTimeout(viewportSettleTimeouts.pop());
+  }
+}
+
+function scheduleInitialViewportSettle() {
+  cancelInitialViewportSettle();
+
+  const delays = [0, 80, 180, 320, 520, 900];
+  for (const delay of delays) {
+    const timeoutId = window.setTimeout(() => {
+      scheduleViewportUpdate();
+    }, delay);
+    viewportSettleTimeouts.push(timeoutId);
+  }
+
+  let previousKey = "";
+  let stableTicks = 0;
+
+  const settleStep = () => {
+    const metrics = getVisualViewportMetrics();
+    const visualViewport = window.visualViewport;
+    const key = [
+      metrics.width,
+      metrics.height,
+      Math.round((visualViewport?.offsetLeft || 0) * 10),
+      Math.round((visualViewport?.offsetTop || 0) * 10)
+    ].join(":");
+
+    if (key === previousKey) {
+      stableTicks += 1;
+    } else {
+      previousKey = key;
+      stableTicks = 0;
+      scheduleViewportUpdate();
+    }
+
+    if (stableTicks < 4) {
+      viewportSettleRaf = requestAnimationFrame(settleStep);
+    } else {
+      viewportSettleRaf = 0;
+    }
+  };
+
+  viewportSettleRaf = requestAnimationFrame(settleStep);
 }
 
 window.addEventListener("resize", scheduleViewportUpdate);
 window.addEventListener("orientationchange", scheduleViewportUpdate);
+window.addEventListener("load", scheduleInitialViewportSettle);
+window.addEventListener("pageshow", scheduleInitialViewportSettle);
+window.visualViewport?.addEventListener("resize", scheduleViewportUpdate);
+window.visualViewport?.addEventListener("scroll", scheduleViewportUpdate);
 if (typeof ResizeObserver !== "undefined") {
   const ro = new ResizeObserver(scheduleViewportUpdate);
   ro.observe(container);
 }
 
 setupTuningPanel();
+scheduleInitialViewportSettle();
 
 init().catch((error) => {
   console.error("[hanelab] Failed to initialize scene.", error);

@@ -2,7 +2,10 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content, shrink-to-fit=no"
+  >
   <title>hanelab</title>
   <style>
     :root {
@@ -12,10 +15,13 @@
     }
 
     html, body {
+      position: fixed;
+      inset: 0;
       margin: 0;
       width: 100%;
       height: 100%;
       overflow: hidden;
+      overscroll-behavior: none;
       background:
         radial-gradient(circle at 50% 50%, rgba(7, 29, 27, 0.92), rgba(1, 4, 5, 1) 70%),
         #010405;
@@ -23,10 +29,15 @@
     }
 
     #app {
-      position: relative;
+      position: fixed;
+      left: 0;
+      top: 0;
+      right: auto;
+      bottom: auto;
       isolation: isolate;
       width: 100%;
       height: 100%;
+      overflow: hidden;
       background:
         radial-gradient(60% 45% at 50% 48%, rgba(12, 51, 47, 0.12), rgba(0, 0, 0, 0) 70%),
         linear-gradient(180deg, rgba(0, 0, 0, 0.2), rgba(0, 0, 0, 0.58)),
@@ -74,12 +85,23 @@
       height: 100%;
     }
 
-    .tuning-panel {
+    .tuning-ui {
       position: absolute;
       top: 18px;
       right: 18px;
       z-index: 5;
-      width: min(240px, calc(100vw - 36px));
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 10px;
+      max-width: calc(100% - 36px);
+      max-height: calc(100% - 36px);
+    }
+
+    .tuning-panel {
+      width: 240px;
+      max-width: 100%;
+      max-height: calc(100% - 52px);
       padding: 12px 14px;
       border: 1px solid rgba(168, 255, 242, 0.18);
       border-radius: 12px;
@@ -92,6 +114,15 @@
       font: 12px/1.35 "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
       letter-spacing: 0.04em;
       user-select: none;
+      overflow-y: auto;
+      overflow-x: hidden;
+      overscroll-behavior: contain;
+      -webkit-overflow-scrolling: touch;
+      scrollbar-gutter: stable;
+    }
+
+    .tuning-ui[data-panel-hidden="true"] .tuning-panel {
+      display: none;
     }
 
     .tuning-title {
@@ -156,68 +187,194 @@
       cursor: ew-resize;
     }
 
+    .tuning-actions {
+      display: flex;
+      justify-content: flex-end;
+      margin-top: 10px;
+    }
+
+    .tuning-button {
+      padding: 6px 10px;
+      border: 1px solid rgba(168, 255, 242, 0.2);
+      border-radius: 8px;
+      background: rgba(6, 18, 20, 0.92);
+      color: rgba(220, 255, 248, 0.92);
+      font: inherit;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      cursor: pointer;
+    }
+
+    .tuning-button:hover {
+      border-color: rgba(41, 227, 198, 0.4);
+      box-shadow: 0 0 0 1px rgba(41, 227, 198, 0.12);
+    }
+
+    .tuning-toggle {
+      min-width: 126px;
+      padding-inline: 12px;
+      backdrop-filter: blur(14px);
+    }
+
+    .tuning-value input[type="checkbox"] {
+      width: 14px;
+      height: 14px;
+      margin: 0;
+      accent-color: rgb(41, 227, 198);
+      cursor: pointer;
+    }
+
+    #app canvas {
+      touch-action: none;
+    }
+
     @media (max-width: 768px) {
-      .tuning-panel {
+      .tuning-ui {
         top: 12px;
         right: 12px;
-        width: min(220px, calc(100vw - 24px));
+        gap: 8px;
+        max-width: calc(100% - 24px);
+        max-height: calc(100% - 24px);
+      }
+
+      .tuning-panel {
+        width: 220px;
+        max-width: 100%;
+        max-height: calc(100% - 48px);
         padding: 10px 12px;
+      }
+
+      .tuning-toggle {
+        min-width: 0;
       }
     }
   </style>
 </head>
 <body>
   <div id="app">
-    <div class="tuning-panel" id="tuning-panel">
+    <div class="tuning-ui" id="tuning-ui" data-panel-hidden="false">
+      <button class="tuning-button tuning-toggle" id="tuning-toggle" type="button" aria-controls="tuning-panel" aria-expanded="true">
+        Hide Controls
+      </button>
+      <div class="tuning-panel" id="tuning-panel">
       <p class="tuning-title">Particle Motion</p>
       <div class="tuning-group">
         <div class="tuning-row">
           <label for="tuning-friction">Friction</label>
           <div class="tuning-value">
-            <input id="tuning-friction-number" type="number" min="0.1" max="100" step="0.1" value="50">
+            <input id="tuning-friction-number" type="number" min="0.01" max="100" step="0.01" value="35.04">
             <span>%</span>
           </div>
         </div>
-        <input id="tuning-friction" type="range" min="0.001" max="1" step="0.001" value="0.5">
+        <input id="tuning-friction" type="range" min="0.0001" max="1" step="0.0001" value="0.3504">
+      </div>
+      <div class="tuning-group">
+        <div class="tuning-row">
+          <label for="tuning-viscosity">Viscosity</label>
+          <div class="tuning-value">
+            <input id="tuning-viscosity-number" type="number" min="0" max="100" step="1" value="35">
+            <span>%</span>
+          </div>
+        </div>
+        <input id="tuning-viscosity" type="range" min="0" max="1" step="0.001" value="0.35">
       </div>
       <div class="tuning-group">
         <div class="tuning-row">
           <label for="tuning-radius">Radius</label>
           <div class="tuning-value">
-            <input id="tuning-radius-number" type="number" min="1" max="100" step="1" value="20">
+            <input id="tuning-radius-number" type="number" min="1" max="100" step="1" value="25">
             <span>%</span>
           </div>
         </div>
-        <input id="tuning-radius" type="range" min="0.01" max="1" step="0.001" value="0.2">
+        <input id="tuning-radius" type="range" min="0.01" max="1" step="0.001" value="0.25">
+      </div>
+      <div class="tuning-group">
+        <div class="tuning-row">
+          <label for="tuning-activity-gain">Activity Gain</label>
+          <div class="tuning-value">
+            <input id="tuning-activity-gain-number" type="number" min="20" max="400" step="1" value="100">
+            <span>%</span>
+          </div>
+        </div>
+        <input id="tuning-activity-gain" type="range" min="0.2" max="4" step="0.01" value="1">
+      </div>
+      <div class="tuning-group">
+        <div class="tuning-row">
+          <label for="tuning-ambient-flow-enabled">Ambient Flow</label>
+          <div class="tuning-value">
+            <input id="tuning-ambient-flow-enabled" type="checkbox" checked>
+          </div>
+        </div>
+      </div>
+      <div class="tuning-group">
+        <div class="tuning-row">
+          <label for="tuning-ambient-flow-speed">Ambient Speed</label>
+          <div class="tuning-value">
+            <input id="tuning-ambient-flow-speed-number" type="number" min="0" max="250" step="0.1" value="30.0">
+            <span>%</span>
+          </div>
+        </div>
+        <input id="tuning-ambient-flow-speed" type="range" min="0" max="2.5" step="0.001" value="0.30">
       </div>
       <div class="tuning-group">
         <div class="tuning-row">
           <label for="tuning-particle-count">Particles</label>
           <div class="tuning-value">
-            <input id="tuning-particle-count-number" type="number" min="1600" max="100000" step="100" value="3000">
+            <input id="tuning-particle-count-number" type="number" min="1600" max="5000000" step="100" value="500800">
           </div>
         </div>
-        <input id="tuning-particle-count" type="range" min="1600" max="100000" step="100" value="3000">
+        <input id="tuning-particle-count" type="range" min="1600" max="5000000" step="100" value="500800">
       </div>
       <div class="tuning-group">
         <div class="tuning-row">
           <label for="tuning-particle-size">Particle Size</label>
           <div class="tuning-value">
-            <input id="tuning-particle-size-number" type="number" min="50" max="250" step="1" value="100">
+            <input id="tuning-particle-size-number" type="number" min="1" max="24" step="0.1" value="5.0">
+          </div>
+        </div>
+        <input id="tuning-particle-size" type="range" min="1" max="24" step="0.1" value="5.0">
+      </div>
+      <div class="tuning-group">
+        <div class="tuning-row">
+          <label for="tuning-particle-opacity">Particle Opacity</label>
+          <div class="tuning-value">
+            <input id="tuning-particle-opacity-number" type="number" min="0" max="100" step="1" value="100">
             <span>%</span>
           </div>
         </div>
-        <input id="tuning-particle-size" type="range" min="0.5" max="2.5" step="0.01" value="1">
+        <input id="tuning-particle-opacity" type="range" min="0" max="1" step="0.01" value="1">
+      </div>
+      <div class="tuning-group">
+        <div class="tuning-row">
+          <label for="tuning-particle-opacity-randomness">Opacity Random</label>
+          <div class="tuning-value">
+            <input id="tuning-particle-opacity-randomness-number" type="number" min="0" max="100" step="1" value="50">
+            <span>%</span>
+          </div>
+        </div>
+        <input id="tuning-particle-opacity-randomness" type="range" min="0" max="1" step="0.01" value="0.5">
       </div>
       <div class="tuning-group">
         <div class="tuning-row">
           <label for="tuning-particle-size-randomness">Size Random</label>
           <div class="tuning-value">
-            <input id="tuning-particle-size-randomness-number" type="number" min="0" max="100" step="1" value="35">
+            <input id="tuning-particle-size-randomness-number" type="number" min="0" max="100" step="1" value="50">
             <span>%</span>
           </div>
         </div>
-        <input id="tuning-particle-size-randomness" type="range" min="0" max="1" step="0.01" value="0.35">
+        <input id="tuning-particle-size-randomness" type="range" min="0" max="1" step="0.01" value="0.5">
+      </div>
+      <div class="tuning-group">
+        <div class="tuning-row">
+          <label for="tuning-show-cursor">Show Cursor</label>
+          <div class="tuning-value">
+            <input id="tuning-show-cursor" type="checkbox">
+          </div>
+        </div>
+      </div>
+      <div class="tuning-actions">
+        <button class="tuning-button" id="tuning-reset" type="button">Reset</button>
+      </div>
       </div>
     </div>
   </div>
