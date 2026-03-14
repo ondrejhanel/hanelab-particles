@@ -18,7 +18,11 @@ const {
   INT,
   LINEAR,
   NEAREST,
-  CLAMP_TO_EDGE
+  CLAMP_TO_EDGE,
+  PRECISION_HIGH_P,
+  PRECISION_MEDIUM_P,
+  isHighpSupportedInVertexShader,
+  isHighpSupportedInFragmentShader
 } = GPUIO_API;
 
 const FONT_URL = "./_Assets/Monoton-Regular.ttf";
@@ -35,9 +39,15 @@ const MAX_PARTICLES = 5000000;
 const WORDMARK_DISPLAY_SCALE = 0.4;
 const WORDMARK_DEPTH_OFFSET = -18;
 const COUNT_STEP = 100;
-const FLUID_COLS = 72;
-const FLUID_ROWS = 40;
-const FLUID_CELL_COUNT = FLUID_COLS * FLUID_ROWS;
+const FLUID_TARGET_CELL_COUNT_DESKTOP = 72 * 40;
+const FLUID_TARGET_CELL_COUNT_MOBILE = 64 * 128;
+const FLUID_MIN_COLS = 24;
+const FLUID_MAX_COLS = 160;
+const FLUID_MIN_ROWS = 24;
+const FLUID_MAX_ROWS = 160;
+const MOBILE_FLUID_LOCK_GROWTH_THRESHOLD = 24;
+const MOBILE_FLUID_LOCK_WIDTH_DELTA = 64;
+const MOBILE_FLUID_LOCK_HEIGHT_DELTA = 160;
 const TUNING_STORAGE_KEY = "hanelab-motion-tuning";
 const FRICTION_MIN = 0.0001;
 const FRICTION_MAX = 1;
@@ -102,10 +112,24 @@ const FLUID_COUPLING_BASE = 0.06;
 const FLUID_COUPLING_WAKE = 0.2;
 const FLUID_RELAX_BASE = 0.014;
 const FLUID_RELAX_WAKE = 0.05;
-const FLUID_JACOBI_STEPS = 4;
+const FLUID_JACOBI_STEPS_DESKTOP = 4;
+const FLUID_JACOBI_STEPS_MOBILE = 24;
+const MOBILE_FLUID_READBACK_SMOOTH_PASSES = 1;
+const MOBILE_FLUID_BLUR_MIN = 0.12;
+const MOBILE_FLUID_BLUR_MAX = 0.34;
 const FLUID_MAX_VELOCITY = 36;
 const FLUID_SAMPLE_SCALE = 0.22;
 const FLUID_MIN_IMPULSE_PX = 12;
+const FLUID_MIN_IMPULSE_CELLS = 1.2;
+const FLUID_SHADER_PRECISION_HEADER = `
+      #ifdef GL_FRAGMENT_PRECISION_HIGH
+      precision highp float;
+      precision highp int;
+      #else
+      precision mediump float;
+      precision mediump int;
+      #endif
+`;
 const DESKTOP_TUNING_VIEWPORT = Object.freeze({ shortSide: 1440, longSide: 3440 });
 const MOBILE_TUNING_VIEWPORT = Object.freeze({ shortSide: 390, longSide: 844 });
 const DEFAULT_MOTION_TUNING = Object.freeze({
@@ -248,16 +272,21 @@ let particleAssignedColorBytes = new Uint8Array(0);
 let particleAssignedIntensity = new Float32Array(0);
 let particleAssignedLetter = new Int16Array(0);
 let particleSpin = new Float32Array(0);
-let fluidVelocityX = new Float32Array(FLUID_CELL_COUNT);
-let fluidVelocityY = new Float32Array(FLUID_CELL_COUNT);
-let fluidVelocityNextX = new Float32Array(FLUID_CELL_COUNT);
-let fluidVelocityNextY = new Float32Array(FLUID_CELL_COUNT);
-let fluidPressure = new Float32Array(FLUID_CELL_COUNT);
-let fluidPressureNext = new Float32Array(FLUID_CELL_COUNT);
-let fluidDivergence = new Float32Array(FLUID_CELL_COUNT);
+let fluidCols = 72;
+let fluidRows = 40;
+let fluidCellCount = fluidCols * fluidRows;
+let fluidVelocityX = new Float32Array(fluidCellCount);
+let fluidVelocityY = new Float32Array(fluidCellCount);
+let fluidVelocityNextX = new Float32Array(fluidCellCount);
+let fluidVelocityNextY = new Float32Array(fluidCellCount);
+let fluidPressure = new Float32Array(fluidCellCount);
+let fluidPressureNext = new Float32Array(fluidCellCount);
+let fluidDivergence = new Float32Array(fluidCellCount);
 let gpuFluid = null;
 let particleFluidTexture = null;
 let particleFluidTextureDirty = true;
+const fluidSimulationMetrics = { width: 1, height: 1 };
+const fluidViewportLock = { active: false, width: 1, height: 1, orientation: "" };
 let positionAttr = null;
 let sizeVarianceAttr = null;
 let particleReferenceAttr = null;
@@ -281,6 +310,7 @@ const pointer = {
   ready: false,
   ndc: new THREE.Vector2(),
   ndcSmooth: new THREE.Vector2(),
+  prevLocal: new THREE.Vector3(),
   local: new THREE.Vector3(),
   velocity: new THREE.Vector3(),
   screen: new THREE.Vector2(),
@@ -317,7 +347,7 @@ const wordmarkColliderMin = new THREE.Vector3();
 const wordmarkColliderMax = new THREE.Vector3();
 const letterPalette = Array.from({ length: LETTER_COUNT }, () => new THREE.Color());
 const letterAccentPalette = Array.from({ length: LETTER_COUNT }, () => new THREE.Color());
-const particleFluidTextureData = new Float32Array(FLUID_CELL_COUNT * 4);
+let particleFluidTextureData = new Float32Array(fluidCellCount * 4);
 cycleBaseColor.copy(TEAL);
 cycleInnerColor.copy(TEAL_SOFT);
 
@@ -366,19 +396,72 @@ function getParticleTextureSize(count) {
   return { width, height };
 }
 
+function roundToEven(value) {
+  return Math.max(2, Math.round(value / 2) * 2);
+}
+
+function getFluidTargetCellCount() {
+  return isMobileLayout ? FLUID_TARGET_CELL_COUNT_MOBILE : FLUID_TARGET_CELL_COUNT_DESKTOP;
+}
+
+function getFluidGridDimensionsForViewport(width, height) {
+  const safeWidth = Math.max(1, width);
+  const safeHeight = Math.max(1, height);
+  const aspect = safeWidth / safeHeight;
+  const targetCellCount = getFluidTargetCellCount();
+  const minCols = isMobileLayout ? 48 : FLUID_MIN_COLS;
+  const minRows = isMobileLayout ? 96 : FLUID_MIN_ROWS;
+  const targetCols = Math.sqrt(targetCellCount * aspect);
+  const targetRows = targetCellCount / Math.max(targetCols, 1);
+
+  return {
+    cols: clamp(roundToEven(targetCols), minCols, FLUID_MAX_COLS),
+    rows: clamp(roundToEven(targetRows), minRows, FLUID_MAX_ROWS)
+  };
+}
+
+function setFluidGridDimensions(cols, rows) {
+  fluidCols = cols;
+  fluidRows = rows;
+  fluidCellCount = fluidCols * fluidRows;
+  fluidVelocityX = new Float32Array(fluidCellCount);
+  fluidVelocityY = new Float32Array(fluidCellCount);
+  fluidVelocityNextX = new Float32Array(fluidCellCount);
+  fluidVelocityNextY = new Float32Array(fluidCellCount);
+  fluidPressure = new Float32Array(fluidCellCount);
+  fluidPressureNext = new Float32Array(fluidCellCount);
+  fluidDivergence = new Float32Array(fluidCellCount);
+  particleFluidTextureData = new Float32Array(fluidCellCount * 4);
+  if (particleFluidTexture) {
+    particleFluidTexture.dispose();
+    particleFluidTexture = null;
+  }
+  particleFluidTextureDirty = true;
+}
+
 function ensureParticleFluidTexture() {
-  if (particleFluidTexture) return particleFluidTexture;
+  if (
+    particleFluidTexture &&
+    particleFluidTexture.image?.width === fluidCols &&
+    particleFluidTexture.image?.height === fluidRows &&
+    particleFluidTexture.image?.data === particleFluidTextureData
+  ) {
+    return particleFluidTexture;
+  }
+  if (particleFluidTexture) {
+    particleFluidTexture.dispose();
+  }
   particleFluidTexture = new THREE.DataTexture(
     particleFluidTextureData,
-    FLUID_COLS,
-    FLUID_ROWS,
+    fluidCols,
+    fluidRows,
     THREE.RGBAFormat,
     THREE.FloatType
   );
   particleFluidTexture.wrapS = THREE.ClampToEdgeWrapping;
   particleFluidTexture.wrapT = THREE.ClampToEdgeWrapping;
-  particleFluidTexture.minFilter = THREE.LinearFilter;
-  particleFluidTexture.magFilter = THREE.LinearFilter;
+  particleFluidTexture.minFilter = THREE.NearestFilter;
+  particleFluidTexture.magFilter = THREE.NearestFilter;
   particleFluidTexture.needsUpdate = true;
   return particleFluidTexture;
 }
@@ -391,7 +474,7 @@ function syncParticleFluidTexture() {
   const texture = ensureParticleFluidTexture();
   if (!particleFluidTextureDirty) return texture;
 
-  for (let i = 0; i < FLUID_CELL_COUNT; i++) {
+  for (let i = 0; i < fluidCellCount; i++) {
     const o = i * 4;
     particleFluidTextureData[o] = fluidVelocityX[i];
     particleFluidTextureData[o + 1] = fluidVelocityY[i];
@@ -402,6 +485,40 @@ function syncParticleFluidTexture() {
   texture.needsUpdate = true;
   particleFluidTextureDirty = false;
   return texture;
+}
+
+function smoothMobileFluidReadbackField() {
+  if (!isMobileLayout || fluidCellCount <= 0) return;
+
+  for (let pass = 0; pass < MOBILE_FLUID_READBACK_SMOOTH_PASSES; pass++) {
+    for (let y = 0; y < fluidRows; y++) {
+      const rowOffset = y * fluidCols;
+      for (let x = 0; x < fluidCols; x++) {
+        const center = rowOffset + x;
+        const left = rowOffset + Math.max(x - 1, 0);
+        const right = rowOffset + Math.min(x + 1, fluidCols - 1);
+        fluidVelocityNextX[center] =
+          (fluidVelocityX[left] + fluidVelocityX[center] * 2 + fluidVelocityX[right]) * 0.25;
+        fluidVelocityNextY[center] =
+          (fluidVelocityY[left] + fluidVelocityY[center] * 2 + fluidVelocityY[right]) * 0.25;
+      }
+    }
+
+    for (let y = 0; y < fluidRows; y++) {
+      const rowOffset = y * fluidCols;
+      const upOffset = Math.max(y - 1, 0) * fluidCols;
+      const downOffset = Math.min(y + 1, fluidRows - 1) * fluidCols;
+      for (let x = 0; x < fluidCols; x++) {
+        const center = rowOffset + x;
+        const up = upOffset + x;
+        const down = downOffset + x;
+        fluidVelocityX[center] =
+          (fluidVelocityNextX[up] + fluidVelocityNextX[center] * 2 + fluidVelocityNextX[down]) * 0.25;
+        fluidVelocityY[center] =
+          (fluidVelocityNextY[up] + fluidVelocityNextY[center] * 2 + fluidVelocityNextY[down]) * 0.25;
+      }
+    }
+  }
 }
 
 function makeLetterColorLookupGLSL(uniformName) {
@@ -682,6 +799,23 @@ function normalizeActivityGain(value) {
 
 function normalizeAmbientFlowSpeed(value) {
   return clamp(value, AMBIENT_FLOW_SPEED_MIN, AMBIENT_FLOW_SPEED_MAX);
+}
+
+function getEffectiveAmbientFlowStrength() {
+  if (isMobileLayout) return 0;
+  return motionTuning.ambientFlowEnabled !== false ? motionTuning.ambientFlowSpeed : 0;
+}
+
+function getEffectiveFluidInteractionMix() {
+  return 1;
+}
+
+function getEffectiveMobileSwipeMix() {
+  return 0;
+}
+
+function getFluidJacobiSteps() {
+  return isMobileLayout ? FLUID_JACOBI_STEPS_MOBILE : FLUID_JACOBI_STEPS_DESKTOP;
 }
 
 function normalizeViscosity(value) {
@@ -972,6 +1106,16 @@ function getEffectiveFluidDecay() {
   return clamp(0.995 - shapedViscosity * 0.055, 0.94, 0.995);
 }
 
+function getEffectiveMobileFluidBlurStrength() {
+  if (!isMobileLayout) return 0;
+  const shapedViscosity = motionTuning.viscosity * (0.5 + motionTuning.viscosity * 0.5);
+  return clamp(
+    MOBILE_FLUID_BLUR_MIN + shapedViscosity * (MOBILE_FLUID_BLUR_MAX - MOBILE_FLUID_BLUR_MIN),
+    0,
+    MOBILE_FLUID_BLUR_MAX
+  );
+}
+
 function updateParticleMaterialTuning() {
   if (!particleMaterial) return;
   const sizeUniforms = particleMaterial.userData.sizeUniforms;
@@ -1134,6 +1278,9 @@ function scheduleParticleResize(delayMs = 0) {
 
 function syncTuningPanel() {
   const displayParticleCount = motionTuning.particleCount ?? (particleTargetCount || particleCount || BASE_PARTICLES);
+  const ambientDisabled = isMobileLayout;
+  const ambientDisplayEnabled = !ambientDisabled && motionTuning.ambientFlowEnabled !== false;
+  const ambientDisplaySpeed = ambientDisabled ? 0 : motionTuning.ambientFlowSpeed;
   if (frictionInput) frictionInput.value = motionTuning.friction.toFixed(4);
   if (frictionNumberInput) frictionNumberInput.value = (motionTuning.friction * 100).toFixed(2);
   if (viscosityInput) viscosityInput.value = motionTuning.viscosity.toFixed(3);
@@ -1143,9 +1290,21 @@ function syncTuningPanel() {
   if (showCursorInput) showCursorInput.checked = motionTuning.showCursor !== false;
   if (activityGainInput) activityGainInput.value = motionTuning.activityGain.toFixed(2);
   if (activityGainNumberInput) activityGainNumberInput.value = (motionTuning.activityGain * 100).toFixed(0);
-  if (ambientFlowEnabledInput) ambientFlowEnabledInput.checked = motionTuning.ambientFlowEnabled !== false;
-  if (ambientFlowSpeedInput) ambientFlowSpeedInput.value = motionTuning.ambientFlowSpeed.toFixed(2);
-  if (ambientFlowSpeedNumberInput) ambientFlowSpeedNumberInput.value = (motionTuning.ambientFlowSpeed * 100).toFixed(1);
+  if (ambientFlowEnabledInput) {
+    ambientFlowEnabledInput.checked = ambientDisplayEnabled;
+    ambientFlowEnabledInput.disabled = ambientDisabled;
+    ambientFlowEnabledInput.title = ambientDisabled ? "Ambient flow is temporarily disabled on mobile for debugging." : "";
+  }
+  if (ambientFlowSpeedInput) {
+    ambientFlowSpeedInput.value = ambientDisplaySpeed.toFixed(2);
+    ambientFlowSpeedInput.disabled = ambientDisabled;
+    ambientFlowSpeedInput.title = ambientDisabled ? "Ambient flow is temporarily disabled on mobile for debugging." : "";
+  }
+  if (ambientFlowSpeedNumberInput) {
+    ambientFlowSpeedNumberInput.value = (ambientDisplaySpeed * 100).toFixed(1);
+    ambientFlowSpeedNumberInput.disabled = ambientDisabled;
+    ambientFlowSpeedNumberInput.title = ambientDisabled ? "Ambient flow is temporarily disabled on mobile for debugging." : "";
+  }
   if (particleCountInput) particleCountInput.value = String(displayParticleCount);
   if (particleCountNumberInput) particleCountNumberInput.value = String(displayParticleCount);
   if (particleSizeInput) particleSizeInput.value = motionTuning.particleSize.toFixed(1);
@@ -1563,12 +1722,19 @@ uniform float uDeltaTime;
 uniform float uFrameScale;
 uniform float uEffectiveFriction;
 uniform float uActivityGain;
+uniform float uAmbientFlowStrength;
+uniform float uAmbientMobileMix;
+uniform float uFluidInteractionMix;
+uniform float uMobileSwipeMix;
 uniform float uPointerActive;
 uniform float uPointerEnergy;
 uniform float uHitRadius;
 uniform vec3 uPointerPosition;
+uniform vec3 uPointerPreviousPosition;
+uniform vec3 uPointerVelocity;
 uniform vec3 uOuterBounds;
 uniform vec2 uFluidBounds;
+uniform vec2 uFluidResolution;
 
 float hash11(const float value) {
   return fract(sin(value * 127.1) * 43758.5453123);
@@ -1591,7 +1757,34 @@ vec2 fluidUvForWorld(const vec2 world) {
   return clamp((world + uFluidBounds) / (uFluidBounds * 2.0), 0.0, 1.0);
 }
 
+vec2 sampleFluidTextureLinear(const vec2 uv) {
+  vec2 resolutionSafe = max(uFluidResolution, vec2(1.0));
+  vec2 grid = clamp(uv, 0.0, 1.0) * resolutionSafe - 0.5;
+  vec2 base = floor(grid);
+  vec2 fracPart = fract(grid);
+  vec2 maxBase = max(resolutionSafe - 1.0, vec2(0.0));
+
+  vec2 baseClamped = clamp(base, vec2(0.0), maxBase);
+  vec2 next = clamp(baseClamped + 1.0, vec2(0.0), maxBase);
+
+  vec2 uv00 = (baseClamped + vec2(0.5)) / resolutionSafe;
+  vec2 uv10 = vec2(next.x + 0.5, baseClamped.y + 0.5) / resolutionSafe;
+  vec2 uv01 = vec2(baseClamped.x + 0.5, next.y + 0.5) / resolutionSafe;
+  vec2 uv11 = (next + vec2(0.5)) / resolutionSafe;
+
+  vec2 s00 = texture2D(uFluidTexture, uv00).xy;
+  vec2 s10 = texture2D(uFluidTexture, uv10).xy;
+  vec2 s01 = texture2D(uFluidTexture, uv01).xy;
+  vec2 s11 = texture2D(uFluidTexture, uv11).xy;
+  vec2 sx0 = mix(s00, s10, fracPart.x);
+  vec2 sx1 = mix(s01, s11, fracPart.x);
+  return mix(sx0, sx1, fracPart.y);
+}
+
 vec2 sampleFluidField(const vec3 position, const float seed) {
+  if (uFluidInteractionMix <= 0.0001) {
+    return vec2(0.0);
+  }
   float sampleOffsetX =
     sin(seed * 11.7 + position.z * 0.006 + uTime * 0.14) * 4.8 +
     sin(seed * 23.1 - position.y * 0.012 - uTime * 0.48) * 2.2;
@@ -1599,9 +1792,62 @@ vec2 sampleFluidField(const vec3 position, const float seed) {
     cos(seed * 13.1 + position.z * 0.005 - uTime * 0.11) * 4.8 +
     cos(seed * 19.7 + position.x * 0.014 + uTime * 0.41) * 2.2;
 
-  vec2 flowA = texture2D(uFluidTexture, fluidUvForWorld(vec2(position.x + sampleOffsetX, position.y + sampleOffsetY))).xy;
-  vec2 flowB = texture2D(uFluidTexture, fluidUvForWorld(vec2(position.x - sampleOffsetY * 0.45, position.y + sampleOffsetX * 0.45))).xy;
-  return mix(flowA, flowB, 0.35);
+  vec2 flowA = sampleFluidTextureLinear(fluidUvForWorld(vec2(position.x + sampleOffsetX, position.y + sampleOffsetY)));
+  vec2 flowB = sampleFluidTextureLinear(fluidUvForWorld(vec2(position.x - sampleOffsetY * 0.45, position.y + sampleOffsetX * 0.45)));
+  return mix(flowA, flowB, 0.35) * uFluidInteractionMix;
+}
+
+vec2 sampleAmbientVortex(const vec2 domain, const vec2 center, const float spin, const float radius) {
+  vec2 delta = domain - center;
+  float falloff = exp(-dot(delta, delta) / max(radius, 0.0001));
+  vec2 tangent = vec2(-delta.y, delta.x);
+  float radiusMag = sqrt(dot(delta, delta) + radius * 0.45);
+  return tangent * (spin * falloff / max(radiusMag, 0.0001));
+}
+
+vec3 sampleMobileAmbientFlow(const vec3 position, const float seed, const float turbulence) {
+  float gain = clamp(uAmbientFlowStrength / ${AMBIENT_FLOW_SPEED_MAX.toFixed(6)}, 0.0, 1.0) * uAmbientMobileMix;
+  if (gain <= 0.0001) {
+    return vec3(0.0);
+  }
+
+  vec2 bounds = max(uFluidBounds, vec2(1.0));
+  vec2 domain = position.xy / bounds;
+  float phase = uTime * mix(0.045, 0.18, sqrt(gain));
+
+  vec2 flow = vec2(0.0);
+  flow += sampleAmbientVortex(
+    domain,
+    vec2(sin(phase * 0.73) * 0.58, cos(phase * 0.91) * 0.44),
+    1.0,
+    0.26
+  );
+  flow += sampleAmbientVortex(
+    domain,
+    vec2(cos(phase * 0.41 + 1.7) * 0.52, sin(phase * 0.63 + 0.8) * 0.36),
+    -0.92,
+    0.31
+  );
+  flow += sampleAmbientVortex(
+    domain,
+    vec2(sin(phase * 0.29 - 0.9) * 0.28, cos(phase * 0.38 + 2.4) * 0.62),
+    0.74,
+    0.42
+  );
+
+  vec2 driftDir = normalize(vec2(1.0, -0.12 + sin(seed * 6.1) * 0.05));
+  float streamMask = exp(-dot(domain * vec2(0.68, 0.46), domain));
+  flow += driftDir * streamMask * 0.34;
+
+  float amplitude = mix(0.0012, 0.0115, pow(gain, 1.15));
+  flow *= amplitude * mix(0.82, 1.08, clamp(turbulence - 0.75, 0.0, 1.0) * 0.5);
+
+  float depth = (
+    sin(seed * 13.7 + uTime * 0.61 + domain.x * 2.3) +
+    cos(seed * 7.1 - uTime * 0.47 + domain.y * 1.9)
+  ) * 0.5;
+
+  return vec3(flow, depth * amplitude * 0.22);
 }
 
 void applyEdgeRepulsion(const vec3 position, const float seed, inout vec3 velocity) {
@@ -1691,21 +1937,65 @@ void simulateVelocity(
   velocity.x += (flow.x - velocity.x) * fluidRelax;
   velocity.y += (flow.y - velocity.y) * fluidRelax;
 
+  vec3 ambientFlow = sampleMobileAmbientFlow(position, seed, turbulence);
+  if (length(ambientFlow) > 0.00001) {
+    float ambientCoupling = mix(0.7, 1.35, wake) * uFrameScale / max(mass, 0.0001);
+    velocity += ambientFlow * ambientCoupling;
+  }
+
   hitFalloff = 0.0;
   if (uPointerActive > 0.5 && uPointerEnergy > 0.0001 && uHitRadius > 0.001) {
     vec3 hit = position - uPointerPosition;
-    float hitDistSq = dot(hit, hit);
-    float hitRadiusSq = uHitRadius * uHitRadius;
-    if (hitDistSq < hitRadiusSq) {
-      float dist = sqrt(hitDistSq);
-      vec3 normal = dist > 0.0001
-        ? hit / dist
-        : normalize(vec3(hash11(seed * 3.1) - 0.5, hash11(seed * 7.7) - 0.5, hash11(seed * 11.9) - 0.5));
-      hitFalloff = pow(1.0 - hitDistSq / hitRadiusSq, 2.0);
-      float depthLift = uPointerEnergy * hitFalloff * 0.16 * uFrameScale;
-      velocity.x += normal.x * depthLift * 0.14;
-      velocity.y += normal.y * depthLift * 0.14;
-      velocity.z += normal.z * depthLift * 0.18 + (hash11(seed * 97.0) - 0.5) * depthLift * 0.08;
+    if (uMobileSwipeMix > 0.5) {
+      vec2 segment = uPointerPosition.xy - uPointerPreviousPosition.xy;
+      float segmentLen = length(segment);
+      vec2 swipeVec = segmentLen > 0.0001 ? segment : uPointerVelocity.xy;
+      float swipeSpeed = length(swipeVec);
+      if (swipeSpeed > 0.0001) {
+        vec2 swipeDir = swipeVec / swipeSpeed;
+        vec2 segmentStart = uPointerPreviousPosition.xy - swipeDir * (uHitRadius * 0.35);
+        vec2 segmentEnd = uPointerPosition.xy + swipeDir * (uHitRadius * 0.22);
+        vec2 segmentVec = segmentEnd - segmentStart;
+        float segmentLenSq = max(dot(segmentVec, segmentVec), 0.0001);
+        float projectedT = clamp(dot(position.xy - segmentStart, segmentVec) / segmentLenSq, 0.0, 1.0);
+        vec2 nearest = segmentStart + segmentVec * projectedT;
+        vec2 delta = position.xy - nearest;
+        float swipeRadius = uHitRadius * 2.35;
+        float distSq = dot(delta, delta);
+        float swipeRadiusSq = swipeRadius * swipeRadius;
+        if (distSq < swipeRadiusSq) {
+          vec2 perpendicular = vec2(-swipeDir.y, swipeDir.x);
+          float lateral = dot(delta, perpendicular);
+          float distNorm = sqrt(distSq) / max(swipeRadius, 0.0001);
+          float coreFalloff = clamp(1.0 - distNorm, 0.0, 1.0);
+          float swipeFalloff = coreFalloff * coreFalloff * (3.0 - 2.0 * coreFalloff);
+          float trailBias = mix(0.65, 1.15, projectedT);
+          float sweepForce =
+            (uPointerEnergy * 0.16 + swipeSpeed * 0.74) *
+            swipeFalloff *
+            trailBias *
+            uFrameScale;
+          velocity.xy += swipeDir * sweepForce;
+          velocity.xy -= delta * swipeFalloff * 0.038 * uFrameScale;
+          velocity.xy -= perpendicular * lateral * swipeFalloff * 0.012 * uFrameScale;
+          velocity.z += (sin(seed * 21.7 + uTime * 4.2) * 0.02 - hit.z * 0.01) * sweepForce;
+          hitFalloff = swipeFalloff * clamp(swipeSpeed * 0.95, 0.0, 1.0);
+        }
+      }
+    } else {
+      float hitDistSq = dot(hit, hit);
+      float hitRadiusSq = uHitRadius * uHitRadius;
+      if (hitDistSq < hitRadiusSq) {
+        float dist = sqrt(hitDistSq);
+        vec3 normal = dist > 0.0001
+          ? hit / dist
+          : normalize(vec3(hash11(seed * 3.1) - 0.5, hash11(seed * 7.7) - 0.5, hash11(seed * 11.9) - 0.5));
+        hitFalloff = pow(1.0 - hitDistSq / hitRadiusSq, 2.0);
+        float depthLift = uPointerEnergy * hitFalloff * 0.16 * uFrameScale;
+        velocity.x += normal.x * depthLift * 0.14;
+        velocity.y += normal.y * depthLift * 0.14;
+        velocity.z += normal.z * depthLift * 0.18 + (hash11(seed * 97.0) - 0.5) * depthLift * 0.08;
+      }
     }
   }
 
@@ -1974,12 +2264,19 @@ function createGpuParticleController(count) {
     uniforms.uFrameScale = { value: 1 };
     uniforms.uEffectiveFriction = { value: getEffectiveFriction() };
     uniforms.uActivityGain = { value: motionTuning.activityGain };
+    uniforms.uAmbientFlowStrength = { value: getEffectiveAmbientFlowStrength() };
+    uniforms.uAmbientMobileMix = { value: 0 };
+    uniforms.uFluidInteractionMix = { value: getEffectiveFluidInteractionMix() };
+    uniforms.uMobileSwipeMix = { value: getEffectiveMobileSwipeMix() };
     uniforms.uPointerActive = { value: 0 };
     uniforms.uPointerEnergy = { value: 0 };
     uniforms.uHitRadius = { value: 0 };
     uniforms.uPointerPosition = { value: new THREE.Vector3() };
+    uniforms.uPointerPreviousPosition = { value: new THREE.Vector3() };
+    uniforms.uPointerVelocity = { value: new THREE.Vector3() };
     uniforms.uOuterBounds = { value: new THREE.Vector3() };
     uniforms.uFluidBounds = { value: new THREE.Vector2() };
+    uniforms.uFluidResolution = { value: new THREE.Vector2(fluidCols, fluidRows) };
   }
   const error = gpuCompute.init();
   if (error) {
@@ -1989,6 +2286,8 @@ function createGpuParticleController(count) {
   function updateSimulationUniforms(dt, frameScale, time, pointerPosition, pointerEnergy, pointerActive, hitRadius) {
     const outerBounds = getParticleSoftBounds(tmpV4);
     const fluidBounds = getFluidFieldBounds(tmpFlowBounds);
+    const effectivePointerActive = isMobileLayout ? 0 : pointerActive ? 1 : 0;
+    const effectivePointerEnergy = isMobileLayout ? 0 : pointerEnergy;
 
     for (const variable of allVariables) {
       const uniforms = variable.material.uniforms;
@@ -1998,12 +2297,19 @@ function createGpuParticleController(count) {
       uniforms.uFrameScale.value = frameScale;
       uniforms.uEffectiveFriction.value = getEffectiveFriction();
       uniforms.uActivityGain.value = motionTuning.activityGain;
-      uniforms.uPointerActive.value = pointerActive ? 1 : 0;
-      uniforms.uPointerEnergy.value = pointerEnergy;
+      uniforms.uAmbientFlowStrength.value = getEffectiveAmbientFlowStrength();
+      uniforms.uAmbientMobileMix.value = 0;
+      uniforms.uFluidInteractionMix.value = getEffectiveFluidInteractionMix();
+      uniforms.uMobileSwipeMix.value = getEffectiveMobileSwipeMix();
+      uniforms.uPointerActive.value = effectivePointerActive;
+      uniforms.uPointerEnergy.value = effectivePointerEnergy;
       uniforms.uHitRadius.value = hitRadius;
       uniforms.uPointerPosition.value.copy(pointerPosition);
+      uniforms.uPointerPreviousPosition.value.copy(pointer.prevLocal);
+      uniforms.uPointerVelocity.value.copy(pointer.velocity);
       uniforms.uOuterBounds.value.copy(outerBounds);
       uniforms.uFluidBounds.value.copy(fluidBounds);
+      uniforms.uFluidResolution.value.set(fluidCols, fluidRows);
     }
 
     if (particleMaterial) {
@@ -2575,19 +2881,19 @@ function resizeParticleSystem(nextCount) {
 }
 
 function sampleFluidArrays(gridX, gridY, fieldX, fieldY, target) {
-  const x = clamp(gridX, 0, FLUID_COLS - 1);
-  const y = clamp(gridY, 0, FLUID_ROWS - 1);
+  const x = clamp(gridX, 0, fluidCols - 1);
+  const y = clamp(gridY, 0, fluidRows - 1);
   const x0 = Math.floor(x);
   const y0 = Math.floor(y);
-  const x1 = Math.min(x0 + 1, FLUID_COLS - 1);
-  const y1 = Math.min(y0 + 1, FLUID_ROWS - 1);
+  const x1 = Math.min(x0 + 1, fluidCols - 1);
+  const y1 = Math.min(y0 + 1, fluidRows - 1);
   const tx = x - x0;
   const ty = y - y0;
 
-  const i00 = y0 * FLUID_COLS + x0;
-  const i10 = y0 * FLUID_COLS + x1;
-  const i01 = y1 * FLUID_COLS + x0;
-  const i11 = y1 * FLUID_COLS + x1;
+  const i00 = y0 * fluidCols + x0;
+  const i10 = y0 * fluidCols + x1;
+  const i01 = y1 * fluidCols + x0;
+  const i11 = y1 * fluidCols + x1;
 
   const vx0 = fieldX[i00] + (fieldX[i10] - fieldX[i00]) * tx;
   const vx1 = fieldX[i01] + (fieldX[i11] - fieldX[i01]) * tx;
@@ -2606,8 +2912,8 @@ function toFluidGridPosition(worldX, worldY, target) {
   const boundX = Math.max(fluidBounds.x, 1);
   const boundY = Math.max(fluidBounds.y, 1);
   target.set(
-    ((clamp(worldX, -boundX, boundX) + boundX) / (boundX * 2)) * (FLUID_COLS - 1),
-    ((clamp(worldY, -boundY, boundY) + boundY) / (boundY * 2)) * (FLUID_ROWS - 1)
+    ((clamp(worldX, -boundX, boundX) + boundX) / (boundX * 2)) * (fluidCols - 1),
+    ((clamp(worldY, -boundY, boundY) + boundY) / (boundY * 2)) * (fluidRows - 1)
   );
   return target;
 }
@@ -2625,8 +2931,62 @@ function getFluidCanvasMetrics() {
   };
 }
 
+function resetFluidViewportLock() {
+  fluidViewportLock.active = false;
+  fluidViewportLock.width = 1;
+  fluidViewportLock.height = 1;
+  fluidViewportLock.orientation = "";
+}
+
+function syncFluidSimulationMetrics(width, height) {
+  const nextWidth = Math.max(1, Math.round(width || 1));
+  const nextHeight = Math.max(1, Math.round(height || 1));
+
+  if (!isMobileLayout) {
+    resetFluidViewportLock();
+    fluidSimulationMetrics.width = nextWidth;
+    fluidSimulationMetrics.height = nextHeight;
+    return fluidSimulationMetrics;
+  }
+
+  const orientation = nextWidth >= nextHeight ? "landscape" : "portrait";
+  const lockNeedsUpdate =
+    !fluidViewportLock.active ||
+    fluidViewportLock.orientation !== orientation ||
+    nextWidth > fluidViewportLock.width + MOBILE_FLUID_LOCK_GROWTH_THRESHOLD ||
+    nextHeight > fluidViewportLock.height + MOBILE_FLUID_LOCK_GROWTH_THRESHOLD ||
+    Math.abs(nextWidth - fluidViewportLock.width) > MOBILE_FLUID_LOCK_WIDTH_DELTA ||
+    Math.abs(nextHeight - fluidViewportLock.height) > MOBILE_FLUID_LOCK_HEIGHT_DELTA;
+
+  if (lockNeedsUpdate) {
+    fluidViewportLock.active = true;
+    fluidViewportLock.width = nextWidth;
+    fluidViewportLock.height = nextHeight;
+    fluidViewportLock.orientation = orientation;
+  }
+
+  fluidSimulationMetrics.width = fluidViewportLock.width;
+  fluidSimulationMetrics.height = fluidViewportLock.height;
+  return fluidSimulationMetrics;
+}
+
+function getFluidSimulationMetrics() {
+  if (fluidSimulationMetrics.width <= 1 && fluidSimulationMetrics.height <= 1) {
+    const baseMetrics = getFluidCanvasMetrics();
+    return syncFluidSimulationMetrics(baseMetrics.width, baseMetrics.height);
+  }
+  return fluidSimulationMetrics;
+}
+
+function getFluidLayerMetrics() {
+  return {
+    width: Math.max(1, fluidCols),
+    height: Math.max(1, fluidRows)
+  };
+}
+
 function mapLocalPointToFluidScreen(localX, localY, target) {
-  const { width, height } = getFluidCanvasMetrics();
+  const { width, height } = getFluidLayerMetrics();
   const fluidBounds = getFluidFieldBounds(tmpFlowBounds);
   target.set(
     ((clamp(localX, -fluidBounds.x, fluidBounds.x) + fluidBounds.x) / Math.max(fluidBounds.x * 2, 1)) * width,
@@ -2636,17 +2996,75 @@ function mapLocalPointToFluidScreen(localX, localY, target) {
 }
 
 function getFluidImpulseThickness() {
-  const { width, height } = getFluidCanvasMetrics();
+  const { width, height } = getFluidLayerMetrics();
   const fluidBounds = getFluidFieldBounds(tmpFlowBounds);
   const hitRadius = getMaxCursorRadius() * motionTuning.radius;
   const scaleX = width / Math.max(fluidBounds.x * 2, 1);
   const scaleY = height / Math.max(fluidBounds.y * 2, 1);
-  return Math.max(FLUID_MIN_IMPULSE_PX, hitRadius * (scaleX + scaleY) * 0.5);
+  return Math.max(FLUID_MIN_IMPULSE_CELLS, hitRadius * (scaleX + scaleY) * 0.5);
 }
 
 function createGPUFluidController() {
-  const gpuComposer = GPUComposer.initWithThreeRenderer(renderer);
-  gpuComposer.undoThreeState();
+  const cols = fluidCols;
+  const rows = fluidRows;
+  const cellCount = cols * rows;
+  const preferredPrecision =
+    typeof isHighpSupportedInVertexShader === "function" &&
+    typeof isHighpSupportedInFragmentShader === "function" &&
+    isHighpSupportedInVertexShader() &&
+    isHighpSupportedInFragmentShader()
+      ? PRECISION_HIGH_P
+      : PRECISION_MEDIUM_P;
+  const useDetachedComposer = isMobileLayout;
+  let fluidComposerCanvas = null;
+  let gpuComposer;
+
+  if (useDetachedComposer) {
+    fluidComposerCanvas = document.createElement("canvas");
+    fluidComposerCanvas.width = Math.max(cols, 1);
+    fluidComposerCanvas.height = Math.max(rows, 1);
+    fluidComposerCanvas.setAttribute("aria-hidden", "true");
+    fluidComposerCanvas.tabIndex = -1;
+    fluidComposerCanvas.style.position = "fixed";
+    fluidComposerCanvas.style.left = "-10000px";
+    fluidComposerCanvas.style.top = "-10000px";
+    fluidComposerCanvas.style.width = "1px";
+    fluidComposerCanvas.style.height = "1px";
+    fluidComposerCanvas.style.opacity = "0";
+    fluidComposerCanvas.style.pointerEvents = "none";
+    fluidComposerCanvas.style.zIndex = "-1";
+    document.body.appendChild(fluidComposerCanvas);
+
+    const contextAttributes = {
+      alpha: false,
+      antialias: false,
+      depth: false,
+      stencil: false,
+      premultipliedAlpha: false,
+      preserveDrawingBuffer: false
+    };
+    const detachedContext =
+      fluidComposerCanvas.getContext("webgl2", contextAttributes) ||
+      fluidComposerCanvas.getContext("webgl", contextAttributes) ||
+      fluidComposerCanvas.getContext("experimental-webgl2", contextAttributes) ||
+      fluidComposerCanvas.getContext("experimental-webgl", contextAttributes);
+    if (!detachedContext) {
+      throw new Error("Unable to initialize detached mobile fluid context.");
+    }
+    gpuComposer = new GPUComposer({
+      canvas: fluidComposerCanvas,
+      context: detachedContext,
+      floatPrecision: preferredPrecision,
+      intPrecision: preferredPrecision
+    });
+    gpuComposer.resize([cols, rows]);
+  } else {
+    gpuComposer = GPUComposer.initWithThreeRenderer(renderer, {
+      floatPrecision: preferredPrecision,
+      intPrecision: preferredPrecision
+    });
+    gpuComposer.undoThreeState();
+  }
   const supportsAsyncReadback = gpuComposer.isWebGL2 && typeof GPULayer.prototype.getValuesAsync === "function";
   let readbackPromise = null;
   let readbackFrameCounter = 0;
@@ -2654,9 +3072,9 @@ function createGPUFluidController() {
 
   const velocityState = new GPULayer(gpuComposer, {
     name: "velocity",
-    dimensions: [FLUID_COLS, FLUID_ROWS],
+    dimensions: [cols, rows],
     type: FLOAT,
-    filter: LINEAR,
+    filter: isMobileLayout ? NEAREST : LINEAR,
     numComponents: 2,
     wrapX: CLAMP_TO_EDGE,
     wrapY: CLAMP_TO_EDGE,
@@ -2664,7 +3082,7 @@ function createGPUFluidController() {
   });
   const divergenceState = new GPULayer(gpuComposer, {
     name: "divergence",
-    dimensions: [FLUID_COLS, FLUID_ROWS],
+    dimensions: [cols, rows],
     type: FLOAT,
     filter: NEAREST,
     numComponents: 1,
@@ -2673,7 +3091,7 @@ function createGPUFluidController() {
   });
   const pressureState = new GPULayer(gpuComposer, {
     name: "pressure",
-    dimensions: [FLUID_COLS, FLUID_ROWS],
+    dimensions: [cols, rows],
     type: FLOAT,
     filter: NEAREST,
     numComponents: 1,
@@ -2685,6 +3103,7 @@ function createGPUFluidController() {
   const advection = new GPUProgram(gpuComposer, {
     name: "advection",
     fragmentShader: `
+      ${FLUID_SHADER_PRECISION_HEADER}
       in vec2 v_uv;
 
       uniform sampler2D u_state;
@@ -2694,8 +3113,32 @@ function createGPUFluidController() {
 
       out vec2 out_state;
 
+      vec2 sampleLinear(const sampler2D samplerTex, const vec2 uv) {
+        vec2 resolutionSafe = max(u_dimensions, vec2(1.0));
+        vec2 grid = clamp(uv, 0.0, 1.0) * resolutionSafe - 0.5;
+        vec2 base = floor(grid);
+        vec2 fracPart = fract(grid);
+        vec2 maxBase = max(resolutionSafe - 1.0, vec2(0.0));
+        vec2 baseClamped = clamp(base, vec2(0.0), maxBase);
+        vec2 next = clamp(baseClamped + 1.0, vec2(0.0), maxBase);
+
+        vec2 uv00 = (baseClamped + vec2(0.5)) / resolutionSafe;
+        vec2 uv10 = vec2(next.x + 0.5, baseClamped.y + 0.5) / resolutionSafe;
+        vec2 uv01 = vec2(baseClamped.x + 0.5, next.y + 0.5) / resolutionSafe;
+        vec2 uv11 = (next + vec2(0.5)) / resolutionSafe;
+
+        vec2 s00 = texture(samplerTex, uv00).xy;
+        vec2 s10 = texture(samplerTex, uv10).xy;
+        vec2 s01 = texture(samplerTex, uv01).xy;
+        vec2 s11 = texture(samplerTex, uv11).xy;
+        vec2 sx0 = mix(s00, s10, fracPart.x);
+        vec2 sx1 = mix(s01, s11, fracPart.x);
+        return mix(sx0, sx1, fracPart.y);
+      }
+
       void main() {
-        vec2 advected = texture(u_state, v_uv - texture(u_velocity, v_uv).xy / u_dimensions).xy;
+        vec2 advectedUv = v_uv - sampleLinear(u_velocity, v_uv) / u_dimensions;
+        vec2 advected = sampleLinear(u_state, advectedUv);
         out_state = advected * u_decay;
       }`,
     uniforms: [
@@ -2708,6 +3151,7 @@ function createGPUFluidController() {
   const divergence2D = new GPUProgram(gpuComposer, {
     name: "divergence2D",
     fragmentShader: `
+      ${FLUID_SHADER_PRECISION_HEADER}
       in vec2 v_uv;
 
       uniform sampler2D u_vectorField;
@@ -2724,12 +3168,13 @@ function createGPUFluidController() {
       }`,
     uniforms: [
       { name: "u_vectorField", value: 0, type: INT },
-      { name: "u_pxSize", value: [1 / FLUID_COLS, 1 / FLUID_ROWS], type: FLOAT }
+      { name: "u_pxSize", value: [1 / cols, 1 / rows], type: FLOAT }
     ]
   });
   const jacobi = new GPUProgram(gpuComposer, {
     name: "jacobi",
     fragmentShader: `
+      ${FLUID_SHADER_PRECISION_HEADER}
       in vec2 v_uv;
 
       uniform float u_alpha;
@@ -2751,7 +3196,7 @@ function createGPUFluidController() {
     uniforms: [
       { name: "u_alpha", value: -1, type: FLOAT },
       { name: "u_beta", value: 0.25, type: FLOAT },
-      { name: "u_pxSize", value: [1 / FLUID_COLS, 1 / FLUID_ROWS], type: FLOAT },
+      { name: "u_pxSize", value: [1 / cols, 1 / rows], type: FLOAT },
       { name: "u_previousState", value: 0, type: INT },
       { name: "u_divergence", value: 1, type: INT }
     ]
@@ -2759,6 +3204,7 @@ function createGPUFluidController() {
   const gradientSubtraction = new GPUProgram(gpuComposer, {
     name: "gradientSubtraction",
     fragmentShader: `
+      ${FLUID_SHADER_PRECISION_HEADER}
       in vec2 v_uv;
 
       uniform vec2 u_pxSize;
@@ -2775,14 +3221,42 @@ function createGPUFluidController() {
         out_result = texture(u_vectorField, v_uv).xy - 0.5 * vec2(e - w, n - s);
       }`,
     uniforms: [
-      { name: "u_pxSize", value: [1 / FLUID_COLS, 1 / FLUID_ROWS], type: FLOAT },
+      { name: "u_pxSize", value: [1 / cols, 1 / rows], type: FLOAT },
       { name: "u_scalarField", value: 0, type: INT },
       { name: "u_vectorField", value: 1, type: INT }
+    ]
+  });
+  const velocityBlur = new GPUProgram(gpuComposer, {
+    name: "velocityBlur",
+    fragmentShader: `
+      ${FLUID_SHADER_PRECISION_HEADER}
+      in vec2 v_uv;
+
+      uniform sampler2D u_velocity;
+      uniform vec2 u_pxSize;
+      uniform float u_strength;
+
+      out vec2 out_velocity;
+
+      void main() {
+        vec2 center = texture(u_velocity, v_uv).xy;
+        vec2 north = texture(u_velocity, v_uv + vec2(0.0, u_pxSize.y)).xy;
+        vec2 south = texture(u_velocity, v_uv - vec2(0.0, u_pxSize.y)).xy;
+        vec2 east = texture(u_velocity, v_uv + vec2(u_pxSize.x, 0.0)).xy;
+        vec2 west = texture(u_velocity, v_uv - vec2(u_pxSize.x, 0.0)).xy;
+        vec2 blurred = center * 0.4 + (north + south + east + west) * 0.15;
+        out_velocity = mix(center, blurred, clamp(u_strength, 0.0, 1.0));
+      }`,
+    uniforms: [
+      { name: "u_velocity", value: 0, type: INT },
+      { name: "u_pxSize", value: [1 / cols, 1 / rows], type: FLOAT },
+      { name: "u_strength", value: 0, type: FLOAT }
     ]
   });
   const touch = new GPUProgram(gpuComposer, {
     name: "touch",
     fragmentShader: `
+      ${FLUID_SHADER_PRECISION_HEADER}
       in vec2 v_uv;
       in vec2 v_uv_local;
 
@@ -2809,6 +3283,7 @@ function createGPUFluidController() {
   const ambientFlow = new GPUProgram(gpuComposer, {
     name: "ambientFlow",
     fragmentShader: `
+      ${FLUID_SHADER_PRECISION_HEADER}
       in vec2 v_uv;
 
       uniform sampler2D u_velocity;
@@ -2829,18 +3304,6 @@ function createGPUFluidController() {
 
         float gain = strength / ${AMBIENT_FLOW_SPEED_MAX.toFixed(6)};
         float phase = u_time * mix(0.05, 0.55, gain);
-
-        float psiA =
-          sin(uv.x * 2.1 + phase * 0.73) *
-          sin(uv.y * 1.45 - phase * 0.41);
-        float psiB =
-          0.42 *
-          sin(uv.x * 4.0 - phase * 0.28 + 1.3) *
-          sin(uv.y * 3.15 + phase * 0.49 - 0.8);
-        float psiC =
-          0.18 *
-          sin((uv.x + uv.y) * 2.3 + phase * 0.22) *
-          cos((uv.x - uv.y) * 1.7 - phase * 0.31);
 
         float dPsiDy =
           sin(uv.x * 2.1 + phase * 0.73) *
@@ -2886,29 +3349,30 @@ function createGPUFluidController() {
   });
 
   function updateDimensions() {
-    const { width, height } = getFluidCanvasMetrics();
+    const { width, height } = getFluidLayerMetrics();
     advection.setUniform("u_dimensions", [width, height]);
     advection.setUniform("u_decay", getEffectiveFluidDecay());
   }
 
   function applyReadback(values) {
-    const { width, height } = getFluidCanvasMetrics();
+    const { width, height } = getFluidLayerMetrics();
     const fluidBounds = getFluidFieldBounds(tmpFlowBounds);
     const scaleX = (fluidBounds.x * 2) / width * FLUID_SAMPLE_SCALE;
     const scaleY = (fluidBounds.y * 2) / height * FLUID_SAMPLE_SCALE;
 
-    for (let i = 0; i < FLUID_CELL_COUNT; i++) {
+    for (let i = 0; i < cellCount; i++) {
       const offset = i * 2;
       fluidVelocityX[i] = values[offset] * scaleX;
       fluidVelocityY[i] = values[offset + 1] * scaleY;
     }
+    smoothMobileFluidReadbackField();
     markParticleFluidTextureDirty();
   }
 
   function requestReadback(force = false) {
     if (readbackPromise) return;
 
-    const interval = particleCount >= 90000 ? 3 : particleCount >= 60000 ? 2 : 1;
+    const interval = isMobileLayout ? 1 : particleCount >= 90000 ? 3 : particleCount >= 60000 ? 2 : 1;
     if (!force) {
       readbackFrameCounter += 1;
       if (readbackFrameCounter < interval) {
@@ -2917,7 +3381,7 @@ function createGPUFluidController() {
     }
     readbackFrameCounter = 0;
 
-    if (supportsAsyncReadback) {
+    if (supportsAsyncReadback && !isMobileLayout) {
       const generation = readbackGeneration;
       readbackPromise = velocityState.getValuesAsync()
         .then((values) => {
@@ -2940,7 +3404,9 @@ function createGPUFluidController() {
   }
 
   function clear() {
-    gpuComposer.undoThreeState();
+    if (!useDetachedComposer) {
+      gpuComposer.undoThreeState();
+    }
     velocityState.clear(true);
     divergenceState.clear();
     pressureState.clear(true);
@@ -2950,11 +3416,15 @@ function createGPUFluidController() {
     fluidVelocityX.fill(0);
     fluidVelocityY.fill(0);
     markParticleFluidTextureDirty();
-    gpuComposer.resetThreeState();
+    if (!useDetachedComposer) {
+      gpuComposer.resetThreeState();
+    }
   }
 
   function step(time) {
-    gpuComposer.undoThreeState();
+    if (!useDetachedComposer) {
+      gpuComposer.undoThreeState();
+    }
     updateDimensions();
     const hadPendingImpulses = pendingFluidImpulses.length > 0;
 
@@ -2969,6 +3439,7 @@ function createGPUFluidController() {
         program: touch,
         input: velocityState,
         output: velocityState,
+        useOutputScale: true,
         position1: impulse.position1,
         position2: impulse.position2,
         thickness: impulse.thickness,
@@ -2976,16 +3447,16 @@ function createGPUFluidController() {
       });
     }
 
-    ambientFlow.setUniform("u_time", time);
-    ambientFlow.setUniform(
-      "u_strength",
-      motionTuning.ambientFlowEnabled !== false ? motionTuning.ambientFlowSpeed : 0
-    );
-    gpuComposer.step({
-      program: ambientFlow,
-      input: velocityState,
-      output: velocityState
-    });
+    const ambientStrength = getEffectiveAmbientFlowStrength();
+    if (!isMobileLayout) {
+      ambientFlow.setUniform("u_time", time);
+      ambientFlow.setUniform("u_strength", ambientStrength);
+      gpuComposer.step({
+        program: ambientFlow,
+        input: velocityState,
+        output: velocityState
+      });
+    }
 
     gpuComposer.step({
       program: advection,
@@ -2997,7 +3468,8 @@ function createGPUFluidController() {
       input: velocityState,
       output: divergenceState
     });
-    for (let i = 0; i < FLUID_JACOBI_STEPS; i++) {
+    const jacobiSteps = getFluidJacobiSteps();
+    for (let i = 0; i < jacobiSteps; i++) {
       gpuComposer.step({
         program: jacobi,
         input: [pressureState, divergenceState],
@@ -3010,8 +3482,20 @@ function createGPUFluidController() {
       output: velocityState
     });
 
+    const mobileBlurStrength = getEffectiveMobileFluidBlurStrength();
+    if (mobileBlurStrength > 0.0001) {
+      velocityBlur.setUniform("u_strength", mobileBlurStrength);
+      gpuComposer.step({
+        program: velocityBlur,
+        input: velocityState,
+        output: velocityState
+      });
+    }
+
     requestReadback(hadPendingImpulses);
-    gpuComposer.resetThreeState();
+    if (!useDetachedComposer) {
+      gpuComposer.resetThreeState();
+    }
   }
 
   function dispose() {
@@ -3022,9 +3506,13 @@ function createGPUFluidController() {
     divergence2D.dispose();
     jacobi.dispose();
     gradientSubtraction.dispose();
+    velocityBlur.dispose();
     touch.dispose();
     ambientFlow.dispose();
     gpuComposer.dispose();
+    if (fluidComposerCanvas?.parentNode) {
+      fluidComposerCanvas.parentNode.removeChild(fluidComposerCanvas);
+    }
   }
 
   updateDimensions();
@@ -3067,6 +3555,19 @@ function stepFluidField(time) {
 }
 
 function updateFluidSimulationSize() {
+  const { width, height } = getFluidSimulationMetrics();
+  const nextGrid = getFluidGridDimensionsForViewport(width, height);
+  const gridChanged = nextGrid.cols !== fluidCols || nextGrid.rows !== fluidRows;
+
+  if (gridChanged) {
+    setFluidGridDimensions(nextGrid.cols, nextGrid.rows);
+    if (gpuFluid) {
+      gpuFluid.dispose();
+      gpuFluid = createGPUFluidController();
+    }
+    return;
+  }
+
   if (!gpuFluid) return;
   gpuFluid.updateDimensions();
   clearFluidField();
@@ -3091,11 +3592,15 @@ function updatePointerProjection(updateMotion) {
 
   if (updateMotion) {
     if (pointer.ready) {
+      pointer.prevLocal.copy(pointer.local);
       tmpV2.copy(tmpV1).sub(pointer.local);
       pointer.velocity.lerp(tmpV2, 0.58);
     } else {
+      pointer.prevLocal.copy(tmpV1);
       pointer.velocity.set(0, 0, 0);
     }
+  } else if (!pointer.ready) {
+    pointer.prevLocal.copy(tmpV1);
   }
 
   pointer.local.copy(tmpV1);
@@ -3150,6 +3655,7 @@ function updateViewport() {
   renderer.setSize(width, height, true);
   composer.setSize(width, height);
   bloomPass.setSize(width, height);
+  syncFluidSimulationMetrics(width, height);
   updateFluidSimulationSize();
 
   camera.aspect = width / height;
@@ -3330,6 +3836,7 @@ function stopPointerInteraction() {
   pointer.active = false;
   pointer.ready = false;
   pointer.speed = 0;
+  pointer.prevLocal.copy(pointer.local);
   pointer.velocity.set(0, 0, 0);
   cursorSphere.visible = false;
 }
